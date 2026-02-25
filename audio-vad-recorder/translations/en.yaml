@@ -1,0 +1,43 @@
+configuration:
+  rtsp_url:
+    name: "RTSP URL"
+    description: >-
+      Full RTSP or RTSPS stream URL of the camera
+      (e.g. rtsps://192.168.1.10:7441/abcdef?enableSrtp).
+  camera_name:
+    name: "Camera name"
+    description: >-
+      A short label used in recorded file names
+      (e.g. 'frontdoor' → frontdoor_20260225_143000.wav).
+  vad_threshold:
+    name: "VAD threshold"
+    description: >-
+      Speech detection sensitivity from 0.0 to 1.0.
+      Lower values detect more sounds (more false positives),
+      higher values require clearer speech.
+      Recommended range: 0.5 – 0.8.
+  pre_padding:
+    name: "Pre-speech padding (seconds)"
+    description: >-
+      Amount of silence to include BEFORE detected speech begins.
+      Prevents the very first syllable from being cut off.
+      Typical value: 0.3 – 0.7.
+  post_padding:
+    name: "Post-speech padding (seconds)"
+    description: >-
+      How long to keep recording silence AFTER speech ends
+      before saving the file. Also acts as the silence timeout —
+      if no speech is detected for this many seconds, the recording
+      is finalized. Gives recordings a natural trailing breath.
+      Typical value: 1.0 – 2.0.
+  min_speech_duration:
+    name: "Minimum speech duration (seconds)"
+    description: >-
+      Recordings shorter than this are discarded as false positives
+      (door slams, coughs, etc.). Set to 0 to keep everything.
+  max_recording_duration:
+    name: "Maximum recording duration (seconds)"
+    description: >-
+      Hard limit on a single recording length.
+      Prevents runaway buffer growth if someone talks for a very long time
+      (e.g. a TV left on). The file is saved and a new recording starts.

@@ -1,0 +1,43 @@
+configuration:
+  rtsp_url:
+    name: "Adres RTSP"
+    description: >-
+      Pełny adres URL strumienia RTSP lub RTSPS kamery
+      (np. rtsps://192.168.1.10:7441/abcdef?enableSrtp).
+  camera_name:
+    name: "Nazwa kamery"
+    description: >-
+      Krótka etykieta używana w nazwach nagranych plików
+      (np. 'wejscie' → wejscie_20260225_143000.wav).
+  vad_threshold:
+    name: "Próg detekcji VAD"
+    description: >-
+      Czułość wykrywania mowy od 0.0 do 1.0.
+      Niższe wartości wykrywają więcej dźwięków (więcej fałszywych alarmów),
+      wyższe wymagają wyraźniejszej mowy.
+      Zalecany zakres: 0.5 – 0.8.
+  pre_padding:
+    name: "Padding przed mową (sekundy)"
+    description: >-
+      Ile sekund ciszy dołączyć PRZED wykrytym początkiem mowy.
+      Zapobiega ucięciu pierwszej sylaby.
+      Typowa wartość: 0.3 – 0.7.
+  post_padding:
+    name: "Padding po mowie (sekundy)"
+    description: >-
+      Jak długo nagrywać ciszę PO zakończeniu mowy przed zapisem pliku.
+      Działa też jako timeout ciszy — jeśli przez tyle sekund nie ma mowy,
+      nagranie zostaje zapisane. Daje nagraniom naturalny „oddech" na końcu.
+      Typowa wartość: 1.0 – 2.0.
+  min_speech_duration:
+    name: "Minimalna długość mowy (sekundy)"
+    description: >-
+      Nagrania krótsze niż ta wartość są odrzucane jako fałszywe alarmy
+      (trzaśnięcie drzwiami, kaszel itp.). Ustaw 0, aby zachować wszystko.
+  max_recording_duration:
+    name: "Maksymalna długość nagrania (sekundy)"
+    description: >-
+      Twardy limit długości pojedynczego nagrania.
+      Zapobiega niekontrolowanemu wzrostowi bufora, gdy ktoś mówi
+      bardzo długo (np. włączony telewizor). Plik zostaje zapisany
+      i rozpoczyna się nowe nagranie.

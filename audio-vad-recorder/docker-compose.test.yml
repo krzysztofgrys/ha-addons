@@ -1,0 +1,73 @@
+version: "3.8"
+
+# ---------------------------------------------------------------------------
+# Integration test with a simulated RTSP stream
+#
+# Quick start:
+#   docker compose -f docker-compose.test.yml up --build
+#   # Wait ~30s, then check:
+#   ls test_output/
+#   # Ctrl+C to stop
+#
+# For meaningful VAD results, mount a real speech WAV file:
+#   1. Place a speech file at ./test_speech.wav
+#   2. Uncomment the volume mount in the publisher service below
+#   3. docker compose -f docker-compose.test.yml up --build
+# ---------------------------------------------------------------------------
+
+services:
+
+  rtsp-server:
+    image: bluenviron/mediamtx:latest
+    ports:
+      - "8554:8554"
+
+  publisher:
+    image: linuxserver/ffmpeg:latest
+    depends_on:
+      - rtsp-server
+    restart: unless-stopped
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        sleep 3
+        echo "=== Starting RTSP publisher ==="
+
+        # If a speech file is mounted, use it (loop forever)
+        if [ -f /test_speech.wav ]; then
+          echo "Using mounted speech file: /test_speech.wav"
+          ffmpeg -re -stream_loop -1 \
+            -i /test_speech.wav \
+            -c:a aac -b:a 64k \
+            -f rtsp rtsp://rtsp-server:8554/test
+        else
+          echo "No speech file mounted – generating synthetic audio pattern."
+          echo "NOTE: Sine tones will NOT trigger Silero VAD."
+          echo "      Mount a real speech WAV for meaningful testing."
+          # Single lavfi source: 300 Hz tone with periodic muting (5s on, 5s off)
+          ffmpeg -re \
+            -f lavfi -i "sine=frequency=300:sample_rate=44100:duration=600" \
+            -af "volume='if(between(mod(t,10),0,5),1,0)':eval=frame" \
+            -c:a aac -b:a 64k \
+            -f rtsp rtsp://rtsp-server:8554/test
+        fi
+    # To use a real speech file, uncomment the next 2 lines:
+    # volumes:
+    #   - ./test_speech.wav:/test_speech.wav:ro
+
+  vad:
+    build: .
+    depends_on:
+      - publisher
+    environment:
+      RTSP_URL: "rtsp://rtsp-server:8554/test"
+      VAD_THRESHOLD: "0.5"
+      CAMERA_NAME: "test"
+      PRE_PADDING: "0.5"
+      POST_PADDING: "1.5"
+      MIN_SPEECH_DURATION: "0.3"
+      MAX_RECORDING_DURATION: "60"
+    volumes:
+      - ./test_output:/media/audio_records
+    entrypoint: ["python", "/main.py"]

@@ -1,0 +1,295 @@
+import os
+import sys
+import signal
+import subprocess
+import threading
+import wave
+import logging
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import torch
+
+# ---------------------------------------------------------------------------
+# Configuration from environment (set by run.sh from /data/options.json)
+# ---------------------------------------------------------------------------
+RTSP_URL = os.environ.get("RTSP_URL", "")
+VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.7"))
+CAMERA_NAME = os.environ.get("CAMERA_NAME", "kamera")
+
+PRE_PADDING_S = float(os.environ.get("PRE_PADDING", "0.5"))
+POST_PADDING_S = float(os.environ.get("POST_PADDING", "1.5"))
+MIN_SPEECH_S = float(os.environ.get("MIN_SPEECH_DURATION", "0.5"))
+MAX_RECORDING_S = int(os.environ.get("MAX_RECORDING_DURATION", "300"))
+
+# ---------------------------------------------------------------------------
+# Derived constants (not user-configurable)
+# ---------------------------------------------------------------------------
+SAMPLE_RATE = 16000
+CHUNK_SAMPLES = 512          # 32 ms at 16 kHz – native Silero VAD window
+BYTES_PER_SAMPLE = 2         # s16le
+CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
+CHUNK_DURATION_S = CHUNK_SAMPLES / SAMPLE_RATE
+
+POST_PADDING_CHUNKS = int(POST_PADDING_S / CHUNK_DURATION_S)
+PRE_PADDING_CHUNKS = max(1, int(PRE_PADDING_S / CHUNK_DURATION_S))
+
+MIN_SPEECH_SAMPLES = int(MIN_SPEECH_S * SAMPLE_RATE)
+MAX_RECORDING_BYTES = int(MAX_RECORDING_S * SAMPLE_RATE * BYTES_PER_SAMPLE)
+
+IDLE_RESET_CHUNKS = int(30.0 / CHUNK_DURATION_S)
+
+OUTPUT_DIR = Path("/media/audio_records")
+RECONNECT_DELAY_S = 5
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+log = logging.getLogger("vad")
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
+running = True
+
+
+def _shutdown(sig, _frame):
+    global running
+    log.info("Received signal %s – shutting down …", sig)
+    running = False
+
+
+signal.signal(signal.SIGTERM, _shutdown)
+signal.signal(signal.SIGINT, _shutdown)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+SILERO_MODEL_PATH = os.environ.get("SILERO_MODEL_PATH", "/opt/silero/silero_vad.jit")
+
+
+def load_vad_model():
+    path = SILERO_MODEL_PATH
+    if os.path.isfile(path):
+        log.info("Loading Silero VAD model from %s …", path)
+        model = torch.jit.load(path, map_location="cpu")
+    else:
+        log.info("Model file not found at %s – downloading via torch.hub …", path)
+        model, _ = torch.hub.load(
+            "snakers4/silero-vad", "silero_vad", trust_repo=True
+        )
+    model.eval()
+    log.info("Silero VAD model ready.")
+    return model
+
+
+def _stderr_drain(pipe):
+    """Daemon thread: reads FFmpeg stderr so the pipe buffer never fills up."""
+    try:
+        for line in pipe:
+            log.warning("FFmpeg: %s", line.decode(errors="replace").rstrip())
+    except Exception:
+        pass
+    finally:
+        pipe.close()
+
+
+def start_ffmpeg(rtsp_url: str) -> subprocess.Popen:
+    is_rtsp = rtsp_url.lower().startswith(("rtsp://", "rtsps://"))
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error"]
+    if is_rtsp:
+        cmd += ["-rtsp_transport", "tcp", "-flags", "low_delay", "-fflags", "nobuffer"]
+    cmd += [
+        "-i", rtsp_url,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", str(SAMPLE_RATE),
+        "-ac", "1",
+        "-f", "s16le",
+        "pipe:1",
+    ]
+    log.info("FFmpeg command: %s", " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    t = threading.Thread(target=_stderr_drain, args=(proc.stderr,), daemon=True)
+    t.start()
+    return proc
+
+
+def pcm_to_tensor(pcm_bytes: bytes) -> torch.Tensor:
+    arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+    arr /= 32768.0
+    return torch.from_numpy(arr)
+
+
+def save_wav(pcm_data: bytearray, filepath: Path):
+    with wave.open(str(filepath), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(BYTES_PER_SAMPLE)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm_data)          # bytearray accepted directly, no copy
+    duration = len(pcm_data) / BYTES_PER_SAMPLE / SAMPLE_RATE
+    log.info("Saved %s  (%.1f s)", filepath.name, duration)
+
+
+def _close_ffmpeg(proc: subprocess.Popen):
+    """Terminate/kill FFmpeg and close the stdout pipe to free the FD."""
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+    try:
+        proc.stdout.close()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Main processing loop
+# ---------------------------------------------------------------------------
+
+
+def _flush_recording(speech_buffer: bytearray, model, reason: str):
+    """Save the current recording buffer and reset state.  Returns empty bytearray."""
+    total_samples = len(speech_buffer) // BYTES_PER_SAMPLE
+    if total_samples >= MIN_SPEECH_SAMPLES:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = OUTPUT_DIR / f"{CAMERA_NAME}_{ts}.wav"
+        save_wav(speech_buffer, filepath)
+        log.info("Flush reason: %s", reason)
+    else:
+        log.debug("Discarding short segment (%.2f s).", total_samples / SAMPLE_RATE)
+    speech_buffer.clear()
+    model.reset_states()
+
+
+def process_stream(model):
+    global running
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ffmpeg = start_ffmpeg(RTSP_URL)
+
+    pre_buffer: deque[bytes] = deque(maxlen=PRE_PADDING_CHUNKS)
+    speech_buffer = bytearray()
+    silence_count = 0
+    idle_count = 0
+    is_recording = False
+
+    try:
+        while running:
+            raw = ffmpeg.stdout.read(CHUNK_BYTES)
+
+            if not raw or len(raw) < CHUNK_BYTES:
+                log.warning("FFmpeg stream ended or incomplete read.")
+                break
+
+            tensor = pcm_to_tensor(raw)
+
+            with torch.no_grad():
+                speech_prob = model(tensor, SAMPLE_RATE).item()
+
+            if speech_prob >= VAD_THRESHOLD:
+                idle_count = 0
+
+                if not is_recording:
+                    log.info(
+                        "Speech started (prob=%.2f, threshold=%.2f)",
+                        speech_prob,
+                        VAD_THRESHOLD,
+                    )
+                    is_recording = True
+                    for chunk in pre_buffer:
+                        speech_buffer.extend(chunk)
+                    pre_buffer.clear()
+
+                speech_buffer.extend(raw)
+                silence_count = 0
+
+                if len(speech_buffer) >= MAX_RECORDING_BYTES:
+                    _flush_recording(speech_buffer, model, "max duration reached")
+                    is_recording = False
+
+            else:
+                if is_recording:
+                    speech_buffer.extend(raw)
+                    silence_count += 1
+
+                    if silence_count >= POST_PADDING_CHUNKS:
+                        _flush_recording(speech_buffer, model, "silence timeout")
+                        silence_count = 0
+                        is_recording = False
+                        idle_count = 0
+                else:
+                    pre_buffer.append(raw)
+                    idle_count += 1
+                    if idle_count >= IDLE_RESET_CHUNKS:
+                        model.reset_states()
+                        idle_count = 0
+
+    finally:
+        if is_recording and len(speech_buffer) > 0:
+            _flush_recording(speech_buffer, model, "stream ended while recording")
+        _close_ffmpeg(ffmpeg)
+
+
+# ---------------------------------------------------------------------------
+# Entry point with auto-reconnect
+# ---------------------------------------------------------------------------
+
+
+def main():
+    global running
+
+    if not RTSP_URL:
+        log.error("RTSP URL is not set – configure it in the add-on options.")
+        sys.exit(1)
+
+    log.info("Configuration:")
+    log.info("  VAD threshold     : %.2f", VAD_THRESHOLD)
+    log.info("  Pre-padding       : %.2f s  (%d chunks)", PRE_PADDING_S, PRE_PADDING_CHUNKS)
+    log.info("  Post-padding      : %.2f s  (%d chunks)", POST_PADDING_S, POST_PADDING_CHUNKS)
+    log.info("  Min speech        : %.2f s", MIN_SPEECH_S)
+    log.info("  Max recording     : %d s", MAX_RECORDING_S)
+    log.info("  Output dir        : %s", OUTPUT_DIR)
+
+    model = load_vad_model()
+
+    while running:
+        try:
+            process_stream(model)
+        except Exception:
+            log.exception("Unexpected error in processing loop.")
+
+        if not running:
+            break
+
+        log.info("Reconnecting in %d s …", RECONNECT_DELAY_S)
+        for _ in range(RECONNECT_DELAY_S * 10):
+            if not running:
+                break
+            time.sleep(0.1)
+
+        model.reset_states()
+
+    log.info("Audio VAD Recorder stopped.")
+
+
+if __name__ == "__main__":
+    main()

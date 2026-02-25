@@ -1,0 +1,28 @@
+name: "Audio VAD Recorder"
+version: "1.1.0"
+slug: "audio_vad_recorder"
+description: "Real-time Voice Activity Detection from RTSP/RTSPS camera audio streams. Records human speech segments as WAV files using Silero VAD."
+url: "https://github.com/home-assistant/addons-example"
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: auto
+map:
+  - media:rw
+options:
+  rtsp_url: ""
+  camera_name: "kamera"
+  vad_threshold: 0.7
+  pre_padding: 0.5
+  post_padding: 1.5
+  min_speech_duration: 0.5
+  max_recording_duration: 300
+schema:
+  rtsp_url: str
+  camera_name: str
+  vad_threshold: "float"
+  pre_padding: "float"
+  post_padding: "float"
+  min_speech_duration: "float"
+  max_recording_duration: int
