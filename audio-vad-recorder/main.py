@@ -9,10 +9,10 @@ import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from queue import Queue, Empty
+from queue import Queue
 
 import numpy as np
-import torch
+import onnxruntime as ort
 
 # ---------------------------------------------------------------------------
 # Configuration from environment (set by run.sh from /data/options.json)
@@ -36,7 +36,7 @@ WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "pl")
 # Derived constants (not user-configurable)
 # ---------------------------------------------------------------------------
 SAMPLE_RATE = 16000
-CHUNK_SAMPLES = 1536         # 96 ms at 16 kHz – native Silero VAD window (3x less CPU than 512)
+CHUNK_SAMPLES = 1536         # 96 ms at 16 kHz – native Silero VAD window
 BYTES_PER_SAMPLE = 2         # s16le
 CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
 CHUNK_DURATION_S = CHUNK_SAMPLES / SAMPLE_RATE
@@ -136,25 +136,49 @@ def stop_transcription_worker():
 
 
 # ---------------------------------------------------------------------------
-# VAD helpers
+# Silero VAD via ONNX Runtime
 # ---------------------------------------------------------------------------
 
-SILERO_MODEL_PATH = os.environ.get("SILERO_MODEL_PATH", "/opt/silero/silero_vad.jit")
+SILERO_MODEL_PATH = os.environ.get("SILERO_MODEL_PATH", "/opt/silero/silero_vad.onnx")
 
 
-def load_vad_model():
+class SileroVAD:
+    """Lightweight wrapper around the Silero VAD ONNX model."""
+
+    def __init__(self, model_path: str):
+        opts = ort.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 1
+        self._session = ort.InferenceSession(model_path, sess_options=opts)
+        self.reset_states()
+        log.info("Silero VAD ONNX model loaded from %s", model_path)
+
+    def reset_states(self):
+        self._h = np.zeros((2, 1, 64), dtype=np.float32)
+        self._c = np.zeros((2, 1, 64), dtype=np.float32)
+
+    def __call__(self, audio_chunk: np.ndarray) -> float:
+        ort_inputs = {
+            "input": audio_chunk.reshape(1, -1),
+            "sr": np.array([SAMPLE_RATE], dtype=np.int64),
+            "h": self._h,
+            "c": self._c,
+        }
+        out, self._h, self._c = self._session.run(None, ort_inputs)
+        return float(out.squeeze())
+
+
+def load_vad_model() -> SileroVAD:
     path = SILERO_MODEL_PATH
-    if os.path.isfile(path):
-        log.info("Loading Silero VAD model from %s …", path)
-        model = torch.jit.load(path, map_location="cpu")
-    else:
-        log.info("Model file not found at %s – downloading via torch.hub …", path)
-        model, _ = torch.hub.load(
-            "snakers4/silero-vad", "silero_vad", trust_repo=True
-        )
-    model.eval()
-    log.info("Silero VAD model ready.")
-    return model
+    if not os.path.isfile(path):
+        log.error("ONNX model not found at %s", path)
+        sys.exit(1)
+    return SileroVAD(path)
+
+
+# ---------------------------------------------------------------------------
+# FFmpeg & audio helpers
+# ---------------------------------------------------------------------------
 
 
 def _stderr_drain(pipe):
@@ -193,10 +217,8 @@ def start_ffmpeg(rtsp_url: str) -> subprocess.Popen:
     return proc
 
 
-def pcm_to_tensor(pcm_bytes: bytes) -> torch.Tensor:
-    arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-    arr /= 32768.0
-    return torch.from_numpy(arr)
+def pcm_to_float(pcm_bytes: bytes) -> np.ndarray:
+    return np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 def save_wav(pcm_data: bytearray, filepath: Path):
@@ -229,7 +251,7 @@ def _close_ffmpeg(proc: subprocess.Popen):
 # ---------------------------------------------------------------------------
 
 
-def _flush_recording(speech_buffer: bytearray, model, reason: str):
+def _flush_recording(speech_buffer: bytearray, model: SileroVAD, reason: str):
     """Save the current recording buffer, queue transcription, reset state."""
     total_samples = len(speech_buffer) // BYTES_PER_SAMPLE
     if total_samples >= MIN_SPEECH_SAMPLES:
@@ -246,7 +268,7 @@ def _flush_recording(speech_buffer: bytearray, model, reason: str):
     model.reset_states()
 
 
-def process_stream(model):
+def process_stream(model: SileroVAD):
     global running
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -266,10 +288,8 @@ def process_stream(model):
                 log.warning("FFmpeg stream ended or incomplete read.")
                 break
 
-            tensor = pcm_to_tensor(raw)
-
-            with torch.no_grad():
-                speech_prob = model(tensor, SAMPLE_RATE).item()
+            audio = pcm_to_float(raw)
+            speech_prob = model(audio)
 
             if speech_prob >= VAD_THRESHOLD:
                 idle_count = 0
