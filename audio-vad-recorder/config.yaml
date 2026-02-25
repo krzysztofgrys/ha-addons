@@ -1,5 +1,5 @@
 name: "Audio VAD Recorder"
-version: "2.0.2"
+version: "2.0.3"
 slug: "audio_vad_recorder"
 description: "Real-time Voice Activity Detection from RTSP/RTSPS camera audio streams. Records human speech segments as WAV files using Silero VAD with optional Whisper transcription."
 url: "https://github.com/krzysztofgrys/ha-addons"
