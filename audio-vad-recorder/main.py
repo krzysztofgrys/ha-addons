@@ -36,7 +36,7 @@ WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "pl")
 # Derived constants (not user-configurable)
 # ---------------------------------------------------------------------------
 SAMPLE_RATE = 16000
-CHUNK_SAMPLES = 512          # 32 ms at 16 kHz – native Silero VAD window
+CHUNK_SAMPLES = 1536         # 96 ms at 16 kHz – native Silero VAD window (3x less CPU than 512)
 BYTES_PER_SAMPLE = 2         # s16le
 CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
 CHUNK_DURATION_S = CHUNK_SAMPLES / SAMPLE_RATE
