@@ -150,21 +150,28 @@ class SileroVAD:
         opts.inter_op_num_threads = 1
         opts.intra_op_num_threads = 1
         self._session = ort.InferenceSession(model_path, sess_options=opts)
+
+        input_names = [inp.name for inp in self._session.get_inputs()]
+        output_names = [out.name for out in self._session.get_outputs()]
+        log.info("ONNX inputs: %s  outputs: %s", input_names, output_names)
+
+        state_input = [i for i in self._session.get_inputs() if "state" in i.name.lower()]
+        self._state_shape = state_input[0].shape if state_input else (2, 1, 128)
+        self._state_name = state_input[0].name if state_input else "state"
+
         self.reset_states()
         log.info("Silero VAD ONNX model loaded from %s", model_path)
 
     def reset_states(self):
-        self._h = np.zeros((2, 1, 64), dtype=np.float32)
-        self._c = np.zeros((2, 1, 64), dtype=np.float32)
+        self._state = np.zeros(self._state_shape, dtype=np.float32)
 
     def __call__(self, audio_chunk: np.ndarray) -> float:
         ort_inputs = {
             "input": audio_chunk.reshape(1, -1),
             "sr": np.array([SAMPLE_RATE], dtype=np.int64),
-            "h": self._h,
-            "c": self._c,
+            self._state_name: self._state,
         }
-        out, self._h, self._c = self._session.run(None, ort_inputs)
+        out, self._state = self._session.run(None, ort_inputs)
         return float(out.squeeze())
 
 
