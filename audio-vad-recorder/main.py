@@ -156,7 +156,8 @@ class SileroVAD:
         log.info("ONNX inputs: %s  outputs: %s", input_names, output_names)
 
         state_input = [i for i in self._session.get_inputs() if "state" in i.name.lower()]
-        self._state_shape = state_input[0].shape if state_input else (2, 1, 128)
+        raw_shape = state_input[0].shape if state_input else [2, 1, 128]
+        self._state_shape = tuple(d if isinstance(d, int) else 1 for d in raw_shape)
         self._state_name = state_input[0].name if state_input else "state"
 
         self.reset_states()
