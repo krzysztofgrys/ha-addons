@@ -9,6 +9,7 @@ import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from queue import Queue, Empty
 
 import numpy as np
 import torch
@@ -24,6 +25,12 @@ PRE_PADDING_S = float(os.environ.get("PRE_PADDING", "0.5"))
 POST_PADDING_S = float(os.environ.get("POST_PADDING", "1.5"))
 MIN_SPEECH_S = float(os.environ.get("MIN_SPEECH_DURATION", "0.5"))
 MAX_RECORDING_S = int(os.environ.get("MAX_RECORDING_DURATION", "300"))
+
+WHISPER_ENABLED = os.environ.get("WHISPER_ENABLED", "false").lower() == "true"
+WHISPER_API_URL = os.environ.get("WHISPER_API_URL", "")
+WHISPER_API_KEY = os.environ.get("WHISPER_API_KEY", "")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
+WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "pl")
 
 # ---------------------------------------------------------------------------
 # Derived constants (not user-configurable)
@@ -72,9 +79,65 @@ signal.signal(signal.SIGTERM, _shutdown)
 signal.signal(signal.SIGINT, _shutdown)
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Whisper transcription (runs in a separate thread)
 # ---------------------------------------------------------------------------
+transcription_queue: Queue[Path] = Queue()
 
+_SENTINEL = None
+
+
+def _transcribe_worker():
+    """Daemon thread: picks WAV files from queue and sends them to Whisper API."""
+    import requests
+
+    session = requests.Session()
+    if WHISPER_API_KEY:
+        session.headers["Authorization"] = f"Bearer {WHISPER_API_KEY}"
+
+    while True:
+        item = transcription_queue.get()
+        if item is _SENTINEL:
+            break
+
+        wav_path: Path = item
+        txt_path = wav_path.with_suffix(".txt")
+
+        try:
+            with open(wav_path, "rb") as f:
+                files = {"file": (wav_path.name, f, "audio/wav")}
+                data = {"model": WHISPER_MODEL, "language": WHISPER_LANGUAGE}
+                resp = session.post(WHISPER_API_URL, files=files, data=data, timeout=30)
+
+            resp.raise_for_status()
+            text = resp.json().get("text", "").strip()
+
+            txt_path.write_text(text, encoding="utf-8")
+            log.info("Transcription [%s]: %s", wav_path.name, text[:120])
+
+        except requests.exceptions.ConnectionError:
+            log.error("Whisper API unreachable: %s", WHISPER_API_URL)
+        except requests.exceptions.Timeout:
+            log.error("Whisper API timeout for %s", wav_path.name)
+        except Exception:
+            log.exception("Transcription failed for %s", wav_path.name)
+        finally:
+            transcription_queue.task_done()
+
+
+def start_transcription_worker() -> threading.Thread:
+    t = threading.Thread(target=_transcribe_worker, daemon=True, name="whisper")
+    t.start()
+    log.info("Whisper transcription worker started.")
+    return t
+
+
+def stop_transcription_worker():
+    transcription_queue.put(_SENTINEL)
+
+
+# ---------------------------------------------------------------------------
+# VAD helpers
+# ---------------------------------------------------------------------------
 
 SILERO_MODEL_PATH = os.environ.get("SILERO_MODEL_PATH", "/opt/silero/silero_vad.jit")
 
@@ -141,7 +204,7 @@ def save_wav(pcm_data: bytearray, filepath: Path):
         wf.setnchannels(1)
         wf.setsampwidth(BYTES_PER_SAMPLE)
         wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(pcm_data)          # bytearray accepted directly, no copy
+        wf.writeframes(pcm_data)
     duration = len(pcm_data) / BYTES_PER_SAMPLE / SAMPLE_RATE
     log.info("Saved %s  (%.1f s)", filepath.name, duration)
 
@@ -167,13 +230,16 @@ def _close_ffmpeg(proc: subprocess.Popen):
 
 
 def _flush_recording(speech_buffer: bytearray, model, reason: str):
-    """Save the current recording buffer and reset state.  Returns empty bytearray."""
+    """Save the current recording buffer, queue transcription, reset state."""
     total_samples = len(speech_buffer) // BYTES_PER_SAMPLE
     if total_samples >= MIN_SPEECH_SAMPLES:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filepath = OUTPUT_DIR / f"{CAMERA_NAME}_{ts}.wav"
         save_wav(speech_buffer, filepath)
         log.info("Flush reason: %s", reason)
+
+        if WHISPER_ENABLED:
+            transcription_queue.put(filepath)
     else:
         log.debug("Discarding short segment (%.2f s).", total_samples / SAMPLE_RATE)
     speech_buffer.clear()
@@ -268,6 +334,12 @@ def main():
     log.info("  Min speech        : %.2f s", MIN_SPEECH_S)
     log.info("  Max recording     : %d s", MAX_RECORDING_S)
     log.info("  Output dir        : %s", OUTPUT_DIR)
+    log.info("  Whisper           : %s", "enabled" if WHISPER_ENABLED else "disabled")
+    if WHISPER_ENABLED:
+        log.info("  Whisper API       : %s", WHISPER_API_URL)
+        log.info("  Whisper model     : %s", WHISPER_MODEL)
+        log.info("  Whisper language  : %s", WHISPER_LANGUAGE)
+        start_transcription_worker()
 
     model = load_vad_model()
 
@@ -287,6 +359,11 @@ def main():
             time.sleep(0.1)
 
         model.reset_states()
+
+    if WHISPER_ENABLED:
+        log.info("Waiting for pending transcriptions …")
+        transcription_queue.join()
+        stop_transcription_worker()
 
     log.info("Audio VAD Recorder stopped.")
 

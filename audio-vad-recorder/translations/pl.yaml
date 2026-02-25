@@ -41,3 +41,33 @@ configuration:
       Zapobiega niekontrolowanemu wzrostowi bufora, gdy ktoś mówi
       bardzo długo (np. włączony telewizor). Plik zostaje zapisany
       i rozpoczyna się nowe nagranie.
+  whisper_enabled:
+    name: "Włącz transkrypcję Whisper"
+    description: >-
+      Po włączeniu każdy nagrany fragment mowy jest wysyłany do
+      API Whisper w celu transkrypcji. Tekst zapisywany jest
+      jako plik .txt obok nagrania .wav.
+  whisper_api_url:
+    name: "Adres API Whisper"
+    description: >-
+      Endpoint transkrypcji kompatybilny z OpenAI.
+      Groq (darmowy): https://api.groq.com/openai/v1/audio/transcriptions
+      OpenAI: https://api.openai.com/v1/audio/transcriptions
+      Lokalny serwer: http://192.168.1.X:8000/v1/audio/transcriptions
+  whisper_api_key:
+    name: "Klucz API Whisper"
+    description: >-
+      Klucz API do usługi transkrypcji. Wymagany dla Groq i OpenAI.
+      Dla lokalnego serwera bez autoryzacji zostaw puste.
+  whisper_model:
+    name: "Model Whisper"
+    description: >-
+      Nazwa modelu do transkrypcji.
+      Groq: whisper-large-v3 (zalecany).
+      OpenAI: whisper-1.
+      Lokalny: zależy od konfiguracji serwera.
+  whisper_language:
+    name: "Język"
+    description: >-
+      Kod języka transkrypcji (np. pl, en, de, fr).
+      Pomaga Whisperowi uzyskać dokładniejsze wyniki.

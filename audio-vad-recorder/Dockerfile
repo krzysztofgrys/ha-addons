@@ -10,7 +10,7 @@ RUN apt-get update && \
 
 RUN pip install --no-cache-dir \
     torch torchaudio --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir numpy
+    pip install --no-cache-dir numpy requests
 
 RUN mkdir -p /opt/silero && \
     python -c "\

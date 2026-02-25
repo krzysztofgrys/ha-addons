@@ -41,3 +41,33 @@ configuration:
       Hard limit on a single recording length.
       Prevents runaway buffer growth if someone talks for a very long time
       (e.g. a TV left on). The file is saved and a new recording starts.
+  whisper_enabled:
+    name: "Enable Whisper transcription"
+    description: >-
+      When enabled, each recorded speech segment is sent to a
+      Whisper-compatible API for transcription. The text is saved
+      as a .txt file alongside the .wav recording.
+  whisper_api_url:
+    name: "Whisper API URL"
+    description: >-
+      OpenAI-compatible transcription endpoint.
+      Groq (free): https://api.groq.com/openai/v1/audio/transcriptions
+      OpenAI: https://api.openai.com/v1/audio/transcriptions
+      Local server: http://192.168.1.X:8000/v1/audio/transcriptions
+  whisper_api_key:
+    name: "Whisper API key"
+    description: >-
+      API key for the transcription service. Required for Groq and OpenAI.
+      For a local server without auth, leave empty.
+  whisper_model:
+    name: "Whisper model"
+    description: >-
+      Model name to use for transcription.
+      Groq: whisper-large-v3 (recommended).
+      OpenAI: whisper-1.
+      Local: depends on your server configuration.
+  whisper_language:
+    name: "Language"
+    description: >-
+      Language code for transcription (e.g. pl, en, de, fr).
+      Helps Whisper produce more accurate results.

@@ -1,8 +1,8 @@
 name: "Audio VAD Recorder"
-version: "1.1.2"
+version: "1.2.0"
 slug: "audio_vad_recorder"
-description: "Real-time Voice Activity Detection from RTSP/RTSPS camera audio streams. Records human speech segments as WAV files using Silero VAD."
-url: "https://github.com/home-assistant/addons-example"
+description: "Real-time Voice Activity Detection from RTSP/RTSPS camera audio streams. Records human speech segments as WAV files using Silero VAD with optional Whisper transcription."
+url: "https://github.com/krzysztofgrys/ha-addons"
 arch:
   - amd64
   - aarch64
@@ -18,6 +18,11 @@ options:
   post_padding: 1.5
   min_speech_duration: 0.5
   max_recording_duration: 300
+  whisper_enabled: false
+  whisper_api_url: "https://api.groq.com/openai/v1/audio/transcriptions"
+  whisper_api_key: ""
+  whisper_model: "whisper-large-v3"
+  whisper_language: "pl"
 schema:
   rtsp_url: str
   camera_name: str
@@ -26,3 +31,8 @@ schema:
   post_padding: "float"
   min_speech_duration: "float"
   max_recording_duration: int
+  whisper_enabled: bool
+  whisper_api_url: str
+  whisper_api_key: password
+  whisper_model: str
+  whisper_language: str
