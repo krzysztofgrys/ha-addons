@@ -4,7 +4,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import wave
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,6 +24,7 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "pl")
 EXPORT_AUDIO_DIR = Path(os.environ.get("EXPORT_AUDIO_DIR", "/share/unifi_protect_audio"))
 KEEP_AUDIO_FILES = os.environ.get("KEEP_AUDIO_FILES", "true").lower() == "true"
+LOCAL_INPUT_DIR = os.environ.get("LOCAL_INPUT_DIR", "").strip()
 SILENCE_THRESHOLD_DB = os.environ.get("SILENCE_THRESHOLD_DB", "-40dB")
 START_SILENCE_DURATION = float(os.environ.get("START_SILENCE_DURATION", "0.2"))
 STOP_SILENCE_DURATION = float(os.environ.get("STOP_SILENCE_DURATION", "0.5"))
@@ -92,17 +92,29 @@ def authenticate_unifi(session: requests.Session) -> str:
 # Config validation
 # ---------------------------------------------------------------------------
 
+def is_local_mode() -> bool:
+    return bool(LOCAL_INPUT_DIR)
+
+
 def validate_config() -> None:
-    if not UNIFI_BASE_URL:
-        raise ValueError("UNIFI_BASE_URL is empty")
-    if not CAMERA_ID:
-        raise ValueError("CAMERA_ID is empty")
-    if not UNIFI_API_KEY and not (UNIFI_USERNAME and UNIFI_PASSWORD):
-        raise ValueError("Provide either unifi_api_key OR unifi_username + unifi_password")
+    if not is_local_mode():
+        if not UNIFI_BASE_URL:
+            raise ValueError("UNIFI_BASE_URL is empty")
+        if not CAMERA_ID:
+            raise ValueError("CAMERA_ID is empty")
+        if not UNIFI_API_KEY and not (UNIFI_USERNAME and UNIFI_PASSWORD):
+            raise ValueError("Provide either unifi_api_key OR unifi_username + unifi_password")
+        if HOURS_BACK <= 0:
+            raise ValueError("HOURS_BACK must be > 0")
+    else:
+        input_dir = Path(LOCAL_INPUT_DIR)
+        if not input_dir.is_dir():
+            raise ValueError(f"local_input_dir does not exist: {LOCAL_INPUT_DIR}")
+        mp4s = list(input_dir.glob("*.mp4"))
+        if not mp4s:
+            raise ValueError(f"No MP4 files found in {LOCAL_INPUT_DIR}")
     if WHISPER_ENABLED and not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY is empty")
-    if HOURS_BACK <= 0:
-        raise ValueError("HOURS_BACK must be > 0")
 
 
 # ---------------------------------------------------------------------------
@@ -266,17 +278,28 @@ def merge_wavs(wav_paths, merged_path: Path) -> bool:
     if not wav_paths:
         return False
 
-    with wave.open(str(merged_path), "wb") as out_wav:
-        params = None
-        for idx, src in enumerate(wav_paths):
-            with wave.open(str(src), "rb") as in_wav:
-                if idx == 0:
-                    params = in_wav.getparams()
-                    out_wav.setparams(params)
-                elif in_wav.getparams()[:4] != params[:4]:
-                    log.error("WAV format mismatch while merging: %s", src.name)
-                    return False
-                out_wav.writeframes(in_wav.readframes(in_wav.getnframes()))
+    if len(wav_paths) == 1:
+        shutil.copy2(wav_paths[0], merged_path)
+        return merged_path.exists() and merged_path.stat().st_size > 44
+
+    concat_list = merged_path.parent / "concat_list.txt"
+    with open(concat_list, "w") as f:
+        for p in wav_paths:
+            f.write(f"file '{p}'\n")
+
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "concat", "-safe", "0",
+        "-i", str(concat_list),
+        "-ac", "1", "-ar", "16000", "-sample_fmt", "s16",
+        str(merged_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    cleanup_files([concat_list])
+
+    if result.returncode != 0:
+        log.error("ffmpeg merge failed: %s", result.stderr.strip())
+        return False
 
     return merged_path.exists() and merged_path.stat().st_size > 44
 
@@ -349,6 +372,58 @@ def persist_audio_file(src: Path) -> Path:
 # Main
 # ---------------------------------------------------------------------------
 
+def collect_wavs_from_download(tmp: Path, session: requests.Session) -> list[Path]:
+    token = authenticate_unifi(session)
+    chunk_ranges = build_hour_chunks(HOURS_BACK)
+    wav_paths: list[Path] = []
+
+    for i, (chunk_start, chunk_end) in enumerate(chunk_ranges, start=1):
+        mp4_path = tmp / f"chunk_{i:03d}.mp4"
+        wav_path = tmp / f"chunk_{i:03d}.wav"
+
+        try:
+            downloaded = download_chunk_mp4(
+                session, token, chunk_start, chunk_end, mp4_path
+            )
+        except AuthError:
+            send_home_assistant_notification(
+                message="Autoryzacja UniFi Protect nie powiodla sie (401/403). Sprawdz dane logowania.",
+                title="UniFi Protect Error",
+            )
+            raise
+
+        if not downloaded:
+            cleanup_files([mp4_path, wav_path])
+            continue
+
+        extracted = extract_wav_with_silence_removal(mp4_path, wav_path)
+        cleanup_files([mp4_path])
+
+        if extracted:
+            wav_paths.append(wav_path)
+        else:
+            cleanup_files([wav_path])
+
+    return wav_paths
+
+
+def collect_wavs_from_local(tmp: Path) -> list[Path]:
+    input_dir = Path(LOCAL_INPUT_DIR)
+    mp4_files = sorted(input_dir.glob("*.mp4"))
+    log.info("Local mode: found %d MP4 file(s) in %s", len(mp4_files), input_dir)
+
+    wav_paths: list[Path] = []
+    for i, mp4_path in enumerate(mp4_files, start=1):
+        wav_path = tmp / f"local_{i:03d}.wav"
+        extracted = extract_wav_with_silence_removal(mp4_path, wav_path)
+        if extracted:
+            wav_paths.append(wav_path)
+        else:
+            cleanup_files([wav_path])
+
+    return wav_paths
+
+
 def main() -> int:
     try:
         validate_config()
@@ -356,46 +431,21 @@ def main() -> int:
         log.error("Invalid configuration: %s", exc)
         return 1
 
-    chunk_ranges = build_hour_chunks(HOURS_BACK)
-    wav_paths = []
+    wav_paths: list[Path] = []
     merged_wav = None
     exported_audio = None
 
     with tempfile.TemporaryDirectory(prefix="unifi_hist_") as temp_dir:
         tmp = Path(temp_dir)
-        session = requests.Session()
 
         try:
-            access_key = authenticate_unifi(session)
-
-            for i, (chunk_start, chunk_end) in enumerate(chunk_ranges, start=1):
-                mp4_path = tmp / f"chunk_{i:03d}.mp4"
-                wav_path = tmp / f"chunk_{i:03d}.wav"
-
-                try:
-                    downloaded = download_chunk_mp4(
-                        session, access_key, chunk_start, chunk_end, mp4_path
-                    )
-                except AuthError:
-                    send_home_assistant_notification(
-                        message="Autoryzacja UniFi Protect nie powiodla sie (401/403). Sprawdz dane logowania.",
-                        title="UniFi Protect Error",
-                    )
-                    return 1
-
-                if not downloaded:
-                    cleanup_files([mp4_path, wav_path])
-                    continue
-
-                extracted = extract_wav_with_silence_removal(mp4_path, wav_path)
-
-                # Critical for low-storage systems: remove large MP4 immediately.
-                cleanup_files([mp4_path])
-
-                if extracted:
-                    wav_paths.append(wav_path)
-                else:
-                    cleanup_files([wav_path])
+            if is_local_mode():
+                log.info("Running in LOCAL mode (processing existing MP4 files).")
+                wav_paths = collect_wavs_from_local(tmp)
+            else:
+                log.info("Running in DOWNLOAD mode (fetching from UniFi Protect).")
+                session = requests.Session()
+                wav_paths = collect_wavs_from_download(tmp, session)
 
             if not wav_paths:
                 send_home_assistant_notification(
