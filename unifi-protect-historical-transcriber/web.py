@@ -1,7 +1,5 @@
-import json
 import os
 import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,7 +9,6 @@ from main import EXPORT_AUDIO_DIR, HOURS_BACK, WHISPER_ENABLED, run_pipeline
 
 app = Flask(__name__)
 
-INGRESS_PATH = os.environ.get("INGRESS_PATH", "")
 
 job_lock = threading.Lock()
 current_job = {
@@ -145,7 +142,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const BASE = '{{ ingress_path }}';
+const BASE = window.location.pathname.replace(/\/+$/, '');
 
 document.querySelectorAll('.tab').forEach(t => {
   t.addEventListener('click', () => {
@@ -257,7 +254,6 @@ loadTranscripts();
 def index():
     return render_template_string(
         HTML_TEMPLATE,
-        ingress_path=INGRESS_PATH,
         hours_back=HOURS_BACK,
         export_dir=str(EXPORT_AUDIO_DIR),
         whisper_enabled=WHISPER_ENABLED,

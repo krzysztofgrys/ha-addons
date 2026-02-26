@@ -1,5 +1,5 @@
 name: "UniFi Protect Historical Transcriber"
-version: "2.0.0"
+version: "2.0.1"
 slug: "unifi_protect_historical_transcriber"
 description: "Downloads UniFi Protect historical video in 1-hour chunks, extracts speech audio, transcribes with Whisper. Web UI for managing jobs and browsing results."
 url: "https://github.com/krzysztofgrys/ha-addons"
