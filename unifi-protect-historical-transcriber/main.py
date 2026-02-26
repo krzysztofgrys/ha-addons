@@ -4,11 +4,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 import urllib3
+
+MAX_RETRIES = 3
+RETRY_DELAY_S = 10
+READ_TIMEOUT_S = 1200
 
 
 UNIFI_BASE_URL = os.environ.get("UNIFI_BASE_URL", "").rstrip("/")
@@ -138,6 +143,55 @@ def build_hour_chunks(hours_back: int):
 # Video download
 # ---------------------------------------------------------------------------
 
+def _do_download(session, url, headers, cookies, params, output_path) -> bool:
+    with session.get(
+        url,
+        headers=headers,
+        cookies=cookies,
+        params=params,
+        stream=True,
+        timeout=(15, READ_TIMEOUT_S),
+        verify=VERIFY_TLS,
+    ) as resp:
+        if resp.status_code in (401, 403):
+            if not use_api_key_auth() and cookies.get("TOKEN"):
+                log.warning("Token may have expired, re-authenticating...")
+                new_token = unifi_login(session)
+                retry_resp = session.get(
+                    url,
+                    cookies={"TOKEN": new_token},
+                    params=params,
+                    stream=True,
+                    timeout=(15, READ_TIMEOUT_S),
+                    verify=VERIFY_TLS,
+                )
+                if retry_resp.status_code < 400:
+                    resp = retry_resp
+                else:
+                    body = retry_resp.text[:300]
+                    raise AuthError(f"HTTP {retry_resp.status_code}: {body}")
+            else:
+                body = resp.text[:300]
+                raise AuthError(f"HTTP {resp.status_code}: {body}")
+
+        if resp.status_code >= 400:
+            log.error("UniFi API error %s: %s", resp.status_code, resp.text[:300])
+            return False
+
+        with open(output_path, "wb") as f:
+            for piece in resp.iter_content(chunk_size=1024 * 1024):
+                if piece:
+                    f.write(piece)
+
+    size = output_path.stat().st_size if output_path.exists() else 0
+    if size == 0:
+        log.warning("Downloaded MP4 is empty")
+        return False
+
+    log.info("Chunk downloaded: %s (%.1f MB)", output_path.name, size / 1024 / 1024)
+    return True
+
+
 def download_chunk_mp4(
     session: requests.Session,
     token: str,
@@ -161,75 +215,35 @@ def download_chunk_mp4(
 
     auth_mode = "api_key" if use_api_key_auth() else "cookie_token"
     log.info(
-        "Downloading chunk %s -> %s  (url=%s, camera=%s, auth=%s)",
+        "Downloading chunk %s -> %s  (camera=%s, auth=%s)",
         chunk_start.isoformat(),
         chunk_end.isoformat(),
-        url,
         CAMERA_ID,
         auth_mode,
     )
-    with session.get(
-        url,
-        headers=headers,
-        cookies=cookies,
-        params=params,
-        stream=True,
-        timeout=(10, 600),
-        verify=VERIFY_TLS,
-    ) as resp:
-        if resp.status_code in (401, 403):
-            if not use_api_key_auth() and token:
-                log.warning("Token may have expired, re-authenticating...")
-                try:
-                    new_token = unifi_login(session)
-                except AuthError:
-                    raise
-                retry_resp = session.get(
-                    url,
-                    cookies={"TOKEN": new_token},
-                    params=params,
-                    stream=True,
-                    timeout=(10, 600),
-                    verify=VERIFY_TLS,
-                )
-                if retry_resp.status_code < 400:
-                    resp = retry_resp
-                else:
-                    body = retry_resp.text[:300]
-                    log.error("Re-auth failed (HTTP %s): %s", retry_resp.status_code, body)
-                    raise AuthError(f"HTTP {retry_resp.status_code}: {body}")
-            else:
-                body = resp.text[:300]
-                method = "X-API-Key" if use_api_key_auth() else "cookie_token"
-                log.error(
-                    "UniFi API authentication failed (HTTP %s): %s\n"
-                    "  Auth method: %s\n"
-                    "  Hints:\n"
-                    "  - If using API Key: verify it in UniFi OS -> Settings -> Advanced\n"
-                    "  - If using credentials: check username/password, user needs Protect access\n"
-                    "  - Aborting all remaining chunks.",
-                    resp.status_code,
-                    body,
-                    method,
-                )
-                raise AuthError(f"HTTP {resp.status_code}: {body}")
 
-        if resp.status_code >= 400:
-            log.error("UniFi API error %s: %s", resp.status_code, resp.text[:300])
-            return False
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            if output_path.exists():
+                output_path.unlink()
+            return _do_download(session, url, headers, cookies, params, output_path)
+        except AuthError:
+            raise
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError) as exc:
+            log.warning(
+                "Download attempt %d/%d failed: %s. Retrying in %ds...",
+                attempt, MAX_RETRIES, exc, RETRY_DELAY_S * attempt,
+            )
+            if output_path.exists():
+                output_path.unlink()
+            if attempt == MAX_RETRIES:
+                log.error("All %d download attempts failed for chunk %s", MAX_RETRIES, chunk_start.isoformat())
+                return False
+            time.sleep(RETRY_DELAY_S * attempt)
 
-        with open(output_path, "wb") as f:
-            for piece in resp.iter_content(chunk_size=1024 * 1024):
-                if piece:
-                    f.write(piece)
-
-    size = output_path.stat().st_size if output_path.exists() else 0
-    if size == 0:
-        log.warning("Downloaded MP4 is empty for chunk %s", chunk_start.isoformat())
-        return False
-
-    log.info("Chunk downloaded: %s (%.1f MB)", output_path.name, size / 1024 / 1024)
-    return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +444,7 @@ def run_pipeline(
     hours: int | None = None,
     do_transcribe: bool | None = None,
     status_callback=None,
+    chunks_callback=None,
 ) -> dict:
     """Run the full pipeline. Returns dict with keys: ok, message, audio_file, transcription."""
 
@@ -437,6 +452,10 @@ def run_pipeline(
         log.info(msg)
         if status_callback:
             status_callback(msg)
+
+    def _chunk(event: str, **kwargs):
+        if chunks_callback:
+            chunks_callback(event, **kwargs)
 
     result = {"ok": False, "message": "", "audio_file": None, "transcription": None}
 
@@ -446,6 +465,7 @@ def run_pipeline(
 
     wav_paths: list[Path] = []
     merged_wav = None
+    chunk_cache_dir = None
 
     with tempfile.TemporaryDirectory(prefix="unifi_hist_") as temp_dir:
         tmp = Path(temp_dir)
@@ -456,13 +476,19 @@ def run_pipeline(
                 input_dir = Path(effective_local)
                 mp4_files = sorted(input_dir.glob("*.mp4"))
                 _status(f"Found {len(mp4_files)} MP4 file(s)")
+                _chunk("total", n=len(mp4_files))
                 for i, mp4_path in enumerate(mp4_files, start=1):
                     wav_path = tmp / f"local_{i:03d}.wav"
+                    label = f"{i}/{len(mp4_files)}: {mp4_path.name}"
                     _status(f"Extracting audio from {mp4_path.name} ({i}/{len(mp4_files)})")
+                    _chunk("extracting", label=label)
                     if extract_wav_with_silence_removal(mp4_path, wav_path):
                         wav_paths.append(wav_path)
+                        _chunk("downloaded", label=label)
                     else:
                         cleanup_files([wav_path])
+                        _chunk("failed", label=label)
+                _chunk("done")
             else:
                 _status("DOWNLOAD mode: fetching from UniFi Protect")
                 session = requests.Session()
@@ -476,20 +502,47 @@ def run_pipeline(
                     chunks.append((cursor, chunk_end))
                     cursor = chunk_end
 
+                chunk_cache_dir = EXPORT_AUDIO_DIR / "chunk_cache"
+                chunk_cache_dir.mkdir(parents=True, exist_ok=True)
+                _chunk("total", n=len(chunks))
+
+                skipped = 0
                 for i, (cs, ce) in enumerate(chunks, start=1):
+                    start_ms = int(cs.timestamp() * 1000)
+                    end_ms = int(ce.timestamp() * 1000)
+                    cached_wav = chunk_cache_dir / f"{CAMERA_ID}_{start_ms}_{end_ms}.wav"
+                    label = f"{i}/{len(chunks)}: {cs.strftime('%H:%M')}-{ce.strftime('%H:%M')}"
+
+                    if cached_wav.exists() and cached_wav.stat().st_size > 0:
+                        _status(f"Chunk {label} already cached, skipping")
+                        wav_paths.append(cached_wav)
+                        skipped += 1
+                        _chunk("skipped", label=label)
+                        continue
+
                     mp4_path = tmp / f"chunk_{i:03d}.mp4"
-                    wav_path = tmp / f"chunk_{i:03d}.wav"
-                    _status(f"Downloading chunk {i}/{len(chunks)}: {cs.strftime('%H:%M')} - {ce.strftime('%H:%M')}")
+                    _status(f"Downloading chunk {label}")
+                    _chunk("downloading", label=label)
                     downloaded = download_chunk_mp4(session, token, cs, ce, mp4_path)
                     if not downloaded:
-                        cleanup_files([mp4_path, wav_path])
+                        cleanup_files([mp4_path])
+                        _chunk("failed", label=label)
                         continue
-                    _status(f"Extracting audio from chunk {i}")
-                    if extract_wav_with_silence_removal(mp4_path, wav_path):
-                        wav_paths.append(wav_path)
+                    _status(f"Extracting audio from chunk {i}/{len(chunks)}")
+                    _chunk("extracting", label=label)
+                    wav_tmp = tmp / f"chunk_{i:03d}.wav"
+                    if extract_wav_with_silence_removal(mp4_path, wav_tmp):
+                        shutil.copy2(wav_tmp, cached_wav)
+                        wav_paths.append(cached_wav)
+                        cleanup_files([wav_tmp])
                     else:
-                        cleanup_files([wav_path])
+                        cleanup_files([wav_tmp])
                     cleanup_files([mp4_path])
+                    _chunk("downloaded", label=label)
+
+                _chunk("done")
+                if skipped:
+                    _status(f"Skipped {skipped} already-cached chunk(s)")
 
             if not wav_paths:
                 result["ok"] = True
@@ -519,21 +572,27 @@ def run_pipeline(
 
                 send_home_assistant_notification(message=text, title="UniFi Protect Transcription")
 
+            if chunk_cache_dir and chunk_cache_dir.exists():
+                _status("Cleaning up chunk cache...")
+                shutil.rmtree(chunk_cache_dir, ignore_errors=True)
+
             result["ok"] = True
             result["message"] = "Pipeline completed successfully."
             return result
 
         except AuthError as exc:
             result["message"] = f"Auth error: {exc}"
+            _status("Cached chunks preserved for retry.")
             return result
 
         except Exception as exc:
             log.exception("Pipeline failed: %s", exc)
             result["message"] = f"Error: {exc}"
+            _status("Cached chunks preserved for retry.")
             return result
 
         finally:
-            cleanup_files(wav_paths + ([merged_wav] if merged_wav else []))
+            cleanup_files([merged_wav] if merged_wav else [])
 
 
 def main() -> int:
