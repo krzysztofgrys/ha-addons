@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,9 +15,13 @@ UNIFI_BASE_URL = os.environ.get("UNIFI_BASE_URL", "").rstrip("/")
 UNIFI_API_KEY = os.environ.get("UNIFI_API_KEY", "")
 CAMERA_ID = os.environ.get("CAMERA_ID", "")
 HOURS_BACK = int(os.environ.get("HOURS_BACK", "6"))
+WHISPER_ENABLED = os.environ.get("WHISPER_ENABLED", "true").lower() == "true"
+WHISPER_API_URL = os.environ.get("WHISPER_API_URL", "https://api.openai.com/v1/audio/transcriptions")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "pl")
+EXPORT_AUDIO_DIR = Path(os.environ.get("EXPORT_AUDIO_DIR", "/share/unifi_protect_audio"))
+KEEP_AUDIO_FILES = os.environ.get("KEEP_AUDIO_FILES", "true").lower() == "true"
 SILENCE_THRESHOLD_DB = os.environ.get("SILENCE_THRESHOLD_DB", "-40dB")
 START_SILENCE_DURATION = float(os.environ.get("START_SILENCE_DURATION", "0.2"))
 STOP_SILENCE_DURATION = float(os.environ.get("STOP_SILENCE_DURATION", "0.5"))
@@ -24,7 +29,6 @@ VERIFY_TLS = os.environ.get("VERIFY_TLS", "false").lower() == "true"
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 
 UNIFI_EXPORT_PATH = "/proxy/protect/api/video/export"
-WHISPER_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
 HA_NOTIFY_ENDPOINT = "http://supervisor/core/api/services/persistent_notification/create"
 CHUNK_DURATION = timedelta(hours=1)
 
@@ -45,7 +49,7 @@ def validate_config() -> None:
         raise ValueError("UNIFI_API_KEY is empty")
     if not CAMERA_ID:
         raise ValueError("CAMERA_ID is empty")
-    if not OPENAI_API_KEY:
+    if WHISPER_ENABLED and not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY is empty")
     if HOURS_BACK <= 0:
         raise ValueError("HOURS_BACK must be > 0")
@@ -161,13 +165,13 @@ def merge_wavs(wav_paths, merged_path: Path) -> bool:
     return merged_path.exists() and merged_path.stat().st_size > 44
 
 
-def transcribe_with_openai(audio_path: Path) -> str:
+def transcribe_with_whisper_api(audio_path: Path) -> str:
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     data = {"model": WHISPER_MODEL, "language": WHISPER_LANGUAGE}
     with open(audio_path, "rb") as f:
         files = {"file": (audio_path.name, f, "audio/wav")}
         response = requests.post(
-            WHISPER_ENDPOINT,
+            WHISPER_API_URL,
             headers=headers,
             data=data,
             files=files,
@@ -205,6 +209,14 @@ def cleanup_files(paths) -> None:
             log.warning("Could not remove %s: %s", p, exc)
 
 
+def persist_audio_file(src: Path) -> Path:
+    EXPORT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    dst = EXPORT_AUDIO_DIR / f"unifi_protect_{CAMERA_ID}_{ts}.wav"
+    shutil.copy2(src, dst)
+    return dst
+
+
 def main() -> int:
     try:
         validate_config()
@@ -215,6 +227,7 @@ def main() -> int:
     chunk_ranges = build_hour_chunks(HOURS_BACK)
     wav_paths = []
     merged_wav = None
+    exported_audio = None
 
     with tempfile.TemporaryDirectory(prefix="unifi_hist_") as temp_dir:
         tmp = Path(temp_dir)
@@ -242,7 +255,7 @@ def main() -> int:
 
             if not wav_paths:
                 send_home_assistant_notification(
-                    message="Brak mowy do transkrypcji w zadanym zakresie czasu.",
+                    message="Brak mowy do transkrypcji/eksportu w zadanym zakresie czasu.",
                     title="UniFi Protect Transcription",
                 )
                 return 0
@@ -256,15 +269,28 @@ def main() -> int:
                 )
                 return 1
 
-            text = transcribe_with_openai(merged_wav)
-            if not text:
-                text = "(Brak treści po transkrypcji)"
+            if KEEP_AUDIO_FILES or not WHISPER_ENABLED:
+                exported_audio = persist_audio_file(merged_wav)
+                log.info("Exported processed audio to %s", exported_audio)
 
-            send_home_assistant_notification(
-                message=text,
-                title="UniFi Protect Transcription",
-            )
-            log.info("Notification sent to Home Assistant.")
+            if WHISPER_ENABLED:
+                text = transcribe_with_whisper_api(merged_wav)
+                if not text:
+                    text = "(Brak treści po transkrypcji)"
+
+                send_home_assistant_notification(
+                    message=text,
+                    title="UniFi Protect Transcription",
+                )
+                log.info("Notification sent to Home Assistant.")
+            else:
+                msg = "Whisper disabled. Audio prepared."
+                if exported_audio:
+                    msg = f"{msg} File: {exported_audio}"
+                send_home_assistant_notification(
+                    message=msg,
+                    title="UniFi Protect Audio Export",
+                )
             return 0
 
         except Exception as exc:
