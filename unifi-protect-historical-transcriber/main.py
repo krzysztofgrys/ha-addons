@@ -424,93 +424,124 @@ def collect_wavs_from_local(tmp: Path) -> list[Path]:
     return wav_paths
 
 
-def main() -> int:
-    try:
-        validate_config()
-    except Exception as exc:
-        log.error("Invalid configuration: %s", exc)
-        return 1
+def run_pipeline(
+    mode: str = "auto",
+    local_dir: str | None = None,
+    hours: int | None = None,
+    do_transcribe: bool | None = None,
+    status_callback=None,
+) -> dict:
+    """Run the full pipeline. Returns dict with keys: ok, message, audio_file, transcription."""
+
+    def _status(msg: str):
+        log.info(msg)
+        if status_callback:
+            status_callback(msg)
+
+    result = {"ok": False, "message": "", "audio_file": None, "transcription": None}
+
+    effective_hours = hours if hours is not None else HOURS_BACK
+    effective_transcribe = do_transcribe if do_transcribe is not None else WHISPER_ENABLED
+    effective_local = local_dir if local_dir else (LOCAL_INPUT_DIR if mode == "auto" else "")
 
     wav_paths: list[Path] = []
     merged_wav = None
-    exported_audio = None
 
     with tempfile.TemporaryDirectory(prefix="unifi_hist_") as temp_dir:
         tmp = Path(temp_dir)
 
         try:
-            if is_local_mode():
-                log.info("Running in LOCAL mode (processing existing MP4 files).")
-                wav_paths = collect_wavs_from_local(tmp)
+            if effective_local:
+                _status(f"LOCAL mode: processing MP4 files from {effective_local}")
+                input_dir = Path(effective_local)
+                mp4_files = sorted(input_dir.glob("*.mp4"))
+                _status(f"Found {len(mp4_files)} MP4 file(s)")
+                for i, mp4_path in enumerate(mp4_files, start=1):
+                    wav_path = tmp / f"local_{i:03d}.wav"
+                    _status(f"Extracting audio from {mp4_path.name} ({i}/{len(mp4_files)})")
+                    if extract_wav_with_silence_removal(mp4_path, wav_path):
+                        wav_paths.append(wav_path)
+                    else:
+                        cleanup_files([wav_path])
             else:
-                log.info("Running in DOWNLOAD mode (fetching from UniFi Protect).")
+                _status("DOWNLOAD mode: fetching from UniFi Protect")
                 session = requests.Session()
-                wav_paths = collect_wavs_from_download(tmp, session)
+                token = authenticate_unifi(session)
+                end_ts = datetime.now(timezone.utc)
+                start_ts = end_ts - timedelta(hours=effective_hours)
+                chunks = []
+                cursor = start_ts
+                while cursor < end_ts:
+                    chunk_end = min(cursor + CHUNK_DURATION, end_ts)
+                    chunks.append((cursor, chunk_end))
+                    cursor = chunk_end
+
+                for i, (cs, ce) in enumerate(chunks, start=1):
+                    mp4_path = tmp / f"chunk_{i:03d}.mp4"
+                    wav_path = tmp / f"chunk_{i:03d}.wav"
+                    _status(f"Downloading chunk {i}/{len(chunks)}: {cs.strftime('%H:%M')} - {ce.strftime('%H:%M')}")
+                    downloaded = download_chunk_mp4(session, token, cs, ce, mp4_path)
+                    if not downloaded:
+                        cleanup_files([mp4_path, wav_path])
+                        continue
+                    _status(f"Extracting audio from chunk {i}")
+                    if extract_wav_with_silence_removal(mp4_path, wav_path):
+                        wav_paths.append(wav_path)
+                    else:
+                        cleanup_files([wav_path])
+                    cleanup_files([mp4_path])
 
             if not wav_paths:
-                send_home_assistant_notification(
-                    message="Brak mowy do transkrypcji/eksportu w zadanym zakresie czasu.",
-                    title="UniFi Protect Transcription",
-                )
-                return 0
+                result["ok"] = True
+                result["message"] = "Brak mowy w zadanym zakresie czasu."
+                return result
 
+            _status("Merging audio chunks...")
             merged_wav = tmp / "merged.wav"
-            merged_ok = merge_wavs(wav_paths, merged_wav)
-            if not merged_ok:
-                send_home_assistant_notification(
-                    message="Nie udało się połączyć plików audio.",
-                    title="UniFi Protect Transcription",
-                )
-                return 1
+            if not merge_wavs(wav_paths, merged_wav):
+                result["message"] = "Nie udalo sie polaczyc plikow audio."
+                return result
 
-            if KEEP_AUDIO_FILES or not WHISPER_ENABLED:
-                exported_audio = persist_audio_file(merged_wav)
-                log.info("Exported processed audio to %s", exported_audio)
+            audio_file = persist_audio_file(merged_wav)
+            result["audio_file"] = str(audio_file)
+            _status(f"Audio saved: {audio_file}")
 
-            if WHISPER_ENABLED:
+            if effective_transcribe:
+                _status("Transcribing with Whisper API...")
                 text = transcribe_with_whisper_api(merged_wav)
                 if not text:
-                    text = "(Brak treści po transkrypcji)"
+                    text = "(Brak tresci po transkrypcji)"
+                result["transcription"] = text
 
-                send_home_assistant_notification(
-                    message=text,
-                    title="UniFi Protect Transcription",
-                )
-                log.info("Notification sent to Home Assistant.")
-            else:
-                msg = "Whisper disabled. Audio prepared."
-                if exported_audio:
-                    msg = f"{msg} File: {exported_audio}"
-                send_home_assistant_notification(
-                    message=msg,
-                    title="UniFi Protect Audio Export",
-                )
-            return 0
+                txt_path = audio_file.with_suffix(".txt")
+                txt_path.write_text(text, encoding="utf-8")
+                _status(f"Transcription saved: {txt_path}")
+
+                send_home_assistant_notification(message=text, title="UniFi Protect Transcription")
+
+            result["ok"] = True
+            result["message"] = "Pipeline completed successfully."
+            return result
 
         except AuthError as exc:
-            log.error("Authentication failed: %s", exc)
-            try:
-                send_home_assistant_notification(
-                    message=f"Autoryzacja UniFi nie powiodla sie: {exc}",
-                    title="UniFi Protect Error",
-                )
-            except Exception:
-                pass
-            return 1
+            result["message"] = f"Auth error: {exc}"
+            return result
 
         except Exception as exc:
-            log.exception("Processing failed: %s", exc)
-            try:
-                send_home_assistant_notification(
-                    message=f"Transkrypcja nie powiodla sie: {exc}",
-                    title="UniFi Protect Transcription",
-                )
-            except Exception:
-                pass
-            return 1
+            log.exception("Pipeline failed: %s", exc)
+            result["message"] = f"Error: {exc}"
+            return result
 
         finally:
             cleanup_files(wav_paths + ([merged_wav] if merged_wav else []))
+
+
+def main() -> int:
+    result = run_pipeline()
+    if not result["ok"]:
+        log.error("Pipeline failed: %s", result["message"])
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

@@ -1,15 +1,19 @@
 name: "UniFi Protect Historical Transcriber"
-version: "1.4.0"
+version: "2.0.0"
 slug: "unifi_protect_historical_transcriber"
-description: "Downloads UniFi Protect historical video in 1-hour chunks, extracts speech audio, transcribes with Whisper, and sends Home Assistant notification."
+description: "Downloads UniFi Protect historical video in 1-hour chunks, extracts speech audio, transcribes with Whisper. Web UI for managing jobs and browsing results."
 url: "https://github.com/krzysztofgrys/ha-addons"
 arch:
   - amd64
   - aarch64
-startup: once
-boot: manual
+startup: application
+boot: auto
 hassio_api: true
 homeassistant_api: true
+ingress: true
+ingress_port: 8099
+panel_icon: "mdi:microphone-message"
+panel_title: "Protect Transcriber"
 map:
   - share:rw
 options:
@@ -24,7 +28,6 @@ options:
   openai_api_key: ""
   whisper_model: "whisper-1"
   whisper_language: "pl"
-  local_input_dir: ""
   export_audio_dir: "/share/unifi_protect_audio"
   keep_audio_files: true
   silence_threshold_db: "-40dB"
@@ -43,7 +46,6 @@ schema:
   openai_api_key: password?
   whisper_model: str
   whisper_language: str
-  local_input_dir: str?
   export_audio_dir: str
   keep_audio_files: bool
   silence_threshold_db: str
