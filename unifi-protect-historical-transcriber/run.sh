@@ -10,6 +10,8 @@ fi
 
 export UNIFI_BASE_URL="$(jq -r '.unifi_base_url // ""' "$CONFIG")"
 export UNIFI_API_KEY="$(jq -r '.unifi_api_key // ""' "$CONFIG")"
+export UNIFI_USERNAME="$(jq -r '.unifi_username // ""' "$CONFIG")"
+export UNIFI_PASSWORD="$(jq -r '.unifi_password // ""' "$CONFIG")"
 export CAMERA_ID="$(jq -r '.camera_id // ""' "$CONFIG")"
 export HOURS_BACK="$(jq -r '.hours_back // 6' "$CONFIG")"
 export WHISPER_ENABLED="$(jq -r '.whisper_enabled // true' "$CONFIG")"
@@ -28,21 +30,33 @@ if [ -z "$UNIFI_BASE_URL" ] || [ "$UNIFI_BASE_URL" = "null" ]; then
     echo "[ERROR] unifi_base_url is not configured."
     exit 1
 fi
-if [ -z "$UNIFI_API_KEY" ] || [ "$UNIFI_API_KEY" = "null" ]; then
-    echo "[ERROR] unifi_api_key is not configured."
-    exit 1
-fi
 if [ -z "$CAMERA_ID" ] || [ "$CAMERA_ID" = "null" ]; then
     echo "[ERROR] camera_id is not configured."
     exit 1
 fi
+
+HAS_API_KEY=false
+HAS_CREDENTIALS=false
+[ -n "$UNIFI_API_KEY" ] && [ "$UNIFI_API_KEY" != "null" ] && HAS_API_KEY=true
+[ -n "$UNIFI_USERNAME" ] && [ "$UNIFI_USERNAME" != "null" ] && \
+[ -n "$UNIFI_PASSWORD" ] && [ "$UNIFI_PASSWORD" != "null" ] && HAS_CREDENTIALS=true
+
+if [ "$HAS_API_KEY" = "false" ] && [ "$HAS_CREDENTIALS" = "false" ]; then
+    echo "[ERROR] Provide either unifi_api_key OR unifi_username + unifi_password."
+    exit 1
+fi
+
 if [ "$WHISPER_ENABLED" = "true" ] && { [ -z "$OPENAI_API_KEY" ] || [ "$OPENAI_API_KEY" = "null" ]; }; then
     echo "[ERROR] openai_api_key is not configured."
     exit 1
 fi
 
+AUTH_MODE="api_key"
+[ "$HAS_API_KEY" = "false" ] && AUTH_MODE="credentials"
+
 echo "[INFO] Starting UniFi Protect Historical Transcriber"
 echo "[INFO]   UniFi URL      : ${UNIFI_BASE_URL}"
+echo "[INFO]   Auth mode      : ${AUTH_MODE}"
 echo "[INFO]   Camera ID      : ${CAMERA_ID}"
 echo "[INFO]   Hours back     : ${HOURS_BACK}"
 echo "[INFO]   Whisper        : ${WHISPER_ENABLED}"

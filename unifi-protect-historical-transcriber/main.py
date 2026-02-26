@@ -14,6 +14,8 @@ import urllib3
 
 UNIFI_BASE_URL = os.environ.get("UNIFI_BASE_URL", "").rstrip("/")
 UNIFI_API_KEY = os.environ.get("UNIFI_API_KEY", "")
+UNIFI_USERNAME = os.environ.get("UNIFI_USERNAME", "")
+UNIFI_PASSWORD = os.environ.get("UNIFI_PASSWORD", "")
 CAMERA_ID = os.environ.get("CAMERA_ID", "")
 HOURS_BACK = int(os.environ.get("HOURS_BACK", "6"))
 WHISPER_ENABLED = os.environ.get("WHISPER_ENABLED", "true").lower() == "true"
@@ -33,7 +35,6 @@ UNIFI_EXPORT_PATH = "/proxy/protect/api/video/export"
 HA_NOTIFY_ENDPOINT = "http://supervisor/core/api/services/persistent_notification/create"
 CHUNK_DURATION = timedelta(hours=1)
 
-
 if not VERIFY_TLS:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -46,18 +47,91 @@ logging.basicConfig(
 log = logging.getLogger("unifi-historical-transcriber")
 
 
+class AuthError(Exception):
+    pass
+
+
+def use_api_key_auth() -> bool:
+    return bool(UNIFI_API_KEY)
+
+
+# ---------------------------------------------------------------------------
+# UniFi Protect auth: login + access-key (credential-based flow)
+# ---------------------------------------------------------------------------
+
+def unifi_login(session: requests.Session) -> str:
+    url = f"{UNIFI_BASE_URL}/api/auth/login"
+    payload = {"username": UNIFI_USERNAME, "password": UNIFI_PASSWORD}
+
+    log.info("Authenticating to UniFi OS as '%s' ...", UNIFI_USERNAME)
+    resp = session.post(url, json=payload, verify=VERIFY_TLS, timeout=15)
+
+    if resp.status_code == 401:
+        raise AuthError("UniFi login failed: invalid username or password.")
+    resp.raise_for_status()
+
+    token = resp.headers.get("Authorization")
+    if not token:
+        csrf = resp.headers.get("X-CSRF-Token", "")
+        if csrf:
+            session.headers["X-CSRF-Token"] = csrf
+        log.info("UniFi login OK (cookie-based session).")
+        return ""
+
+    log.info("UniFi login OK (bearer token).")
+    return token
+
+
+def unifi_get_access_key(session: requests.Session, bearer_token: str) -> str:
+    url = f"{UNIFI_BASE_URL}/api/auth/access-key"
+    headers = {}
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+
+    resp = session.post(url, headers=headers, verify=VERIFY_TLS, timeout=15)
+    if resp.status_code in (401, 403):
+        raise AuthError(f"Failed to obtain access key (HTTP {resp.status_code}).")
+    resp.raise_for_status()
+
+    data = resp.json()
+    access_key = data.get("accessKey", "")
+    if not access_key:
+        raise AuthError(f"Empty accessKey in response: {data}")
+
+    log.info("Access key obtained successfully.")
+    return access_key
+
+
+def authenticate_unifi(session: requests.Session) -> str:
+    """Returns an accessKey for video export (credential flow) or empty string (API key flow)."""
+    if use_api_key_auth():
+        log.info("Using X-API-Key authentication.")
+        return ""
+
+    bearer = unifi_login(session)
+    return unifi_get_access_key(session, bearer)
+
+
+# ---------------------------------------------------------------------------
+# Config validation
+# ---------------------------------------------------------------------------
+
 def validate_config() -> None:
     if not UNIFI_BASE_URL:
         raise ValueError("UNIFI_BASE_URL is empty")
-    if not UNIFI_API_KEY:
-        raise ValueError("UNIFI_API_KEY is empty")
     if not CAMERA_ID:
         raise ValueError("CAMERA_ID is empty")
+    if not UNIFI_API_KEY and not (UNIFI_USERNAME and UNIFI_PASSWORD):
+        raise ValueError("Provide either unifi_api_key OR unifi_username + unifi_password")
     if WHISPER_ENABLED and not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY is empty")
     if HOURS_BACK <= 0:
         raise ValueError("HOURS_BACK must be > 0")
 
+
+# ---------------------------------------------------------------------------
+# Time chunking
+# ---------------------------------------------------------------------------
 
 def build_hour_chunks(hours_back: int):
     end_ts = datetime.now(timezone.utc)
@@ -72,12 +146,16 @@ def build_hour_chunks(hours_back: int):
     return chunks
 
 
-class AuthError(Exception):
-    pass
-
+# ---------------------------------------------------------------------------
+# Video download
+# ---------------------------------------------------------------------------
 
 def download_chunk_mp4(
-    session: requests.Session, chunk_start: datetime, chunk_end: datetime, output_path: Path
+    session: requests.Session,
+    access_key: str,
+    chunk_start: datetime,
+    chunk_end: datetime,
+    output_path: Path,
 ) -> bool:
     url = f"{UNIFI_BASE_URL}{UNIFI_EXPORT_PATH}"
     params = {
@@ -85,14 +163,20 @@ def download_chunk_mp4(
         "start": int(chunk_start.timestamp() * 1000),
         "end": int(chunk_end.timestamp() * 1000),
     }
-    headers = {"X-API-Key": UNIFI_API_KEY}
+    headers = {}
+
+    if use_api_key_auth():
+        headers["X-API-Key"] = UNIFI_API_KEY
+    elif access_key:
+        params["accessKey"] = access_key
 
     log.info(
-        "Downloading chunk %s -> %s  (url=%s, camera=%s)",
+        "Downloading chunk %s -> %s  (url=%s, camera=%s, auth=%s)",
         chunk_start.isoformat(),
         chunk_end.isoformat(),
         url,
         CAMERA_ID,
+        "api_key" if use_api_key_auth() else "access_key",
     )
     with session.get(
         url,
@@ -104,16 +188,17 @@ def download_chunk_mp4(
     ) as resp:
         if resp.status_code in (401, 403):
             body = resp.text[:300]
+            method = "X-API-Key" if use_api_key_auth() else "accessKey (credentials)"
             log.error(
                 "UniFi API authentication failed (HTTP %s): %s\n"
+                "  Auth method: %s\n"
                 "  Hints:\n"
-                "  - Verify your X-API-Key in UniFi OS -> Settings -> Advanced -> API Keys\n"
-                "  - The key must have UniFi Protect permissions\n"
-                "  - Check that unifi_base_url (%s) is correct (UDM uses /proxy/protect/...)\n"
+                "  - If using API Key: verify it in UniFi OS -> Settings -> Advanced\n"
+                "  - If using credentials: check username/password, user must have Protect access\n"
                 "  - Aborting all remaining chunks.",
                 resp.status_code,
                 body,
-                UNIFI_BASE_URL,
+                method,
             )
             raise AuthError(f"HTTP {resp.status_code}: {body}")
 
@@ -134,6 +219,10 @@ def download_chunk_mp4(
     log.info("Chunk downloaded: %s (%.1f MB)", output_path.name, size / 1024 / 1024)
     return True
 
+
+# ---------------------------------------------------------------------------
+# Audio extraction
+# ---------------------------------------------------------------------------
 
 def extract_wav_with_silence_removal(mp4_path: Path, wav_path: Path) -> bool:
     filter_expr = (
@@ -192,6 +281,10 @@ def merge_wavs(wav_paths, merged_path: Path) -> bool:
     return merged_path.exists() and merged_path.stat().st_size > 44
 
 
+# ---------------------------------------------------------------------------
+# Whisper transcription
+# ---------------------------------------------------------------------------
+
 def transcribe_with_whisper_api(audio_path: Path) -> str:
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     data = {"model": WHISPER_MODEL, "language": WHISPER_LANGUAGE}
@@ -207,6 +300,10 @@ def transcribe_with_whisper_api(audio_path: Path) -> str:
     response.raise_for_status()
     return response.json().get("text", "").strip()
 
+
+# ---------------------------------------------------------------------------
+# HA notification
+# ---------------------------------------------------------------------------
 
 def send_home_assistant_notification(message: str, title: str) -> None:
     if not SUPERVISOR_TOKEN:
@@ -227,6 +324,10 @@ def send_home_assistant_notification(message: str, title: str) -> None:
     response.raise_for_status()
 
 
+# ---------------------------------------------------------------------------
+# File helpers
+# ---------------------------------------------------------------------------
+
 def cleanup_files(paths) -> None:
     for p in paths:
         try:
@@ -243,6 +344,10 @@ def persist_audio_file(src: Path) -> Path:
     shutil.copy2(src, dst)
     return dst
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     try:
@@ -261,15 +366,19 @@ def main() -> int:
         session = requests.Session()
 
         try:
+            access_key = authenticate_unifi(session)
+
             for i, (chunk_start, chunk_end) in enumerate(chunk_ranges, start=1):
                 mp4_path = tmp / f"chunk_{i:03d}.mp4"
                 wav_path = tmp / f"chunk_{i:03d}.wav"
 
                 try:
-                    downloaded = download_chunk_mp4(session, chunk_start, chunk_end, mp4_path)
+                    downloaded = download_chunk_mp4(
+                        session, access_key, chunk_start, chunk_end, mp4_path
+                    )
                 except AuthError:
                     send_home_assistant_notification(
-                        message="Autoryzacja UniFi Protect nie powiodla sie (401/403). Sprawdz API Key.",
+                        message="Autoryzacja UniFi Protect nie powiodla sie (401/403). Sprawdz dane logowania.",
                         title="UniFi Protect Error",
                     )
                     return 1
@@ -327,6 +436,17 @@ def main() -> int:
                     title="UniFi Protect Audio Export",
                 )
             return 0
+
+        except AuthError as exc:
+            log.error("Authentication failed: %s", exc)
+            try:
+                send_home_assistant_notification(
+                    message=f"Autoryzacja UniFi nie powiodla sie: {exc}",
+                    title="UniFi Protect Error",
+                )
+            except Exception:
+                pass
+            return 1
 
         except Exception as exc:
             log.exception("Processing failed: %s", exc)
