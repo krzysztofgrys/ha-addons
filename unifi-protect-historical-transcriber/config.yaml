@@ -1,5 +1,5 @@
 name: "UniFi Protect Historical Transcriber"
-version: "1.1.0"
+version: "1.2.0"
 slug: "unifi_protect_historical_transcriber"
 description: "Downloads UniFi Protect historical video in 1-hour chunks, extracts speech audio, transcribes with Whisper, and sends Home Assistant notification."
 url: "https://github.com/krzysztofgrys/ha-addons"
