@@ -56,7 +56,8 @@ def use_api_key_auth() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# UniFi Protect auth: login + access-key (credential-based flow)
+# UniFi Protect auth: cookie TOKEN from /api/auth/login
+# Based on: github.com/danielfernau/unifi-protect-video-downloader
 # ---------------------------------------------------------------------------
 
 def unifi_login(session: requests.Session) -> str:
@@ -70,46 +71,21 @@ def unifi_login(session: requests.Session) -> str:
         raise AuthError("UniFi login failed: invalid username or password.")
     resp.raise_for_status()
 
-    token = resp.headers.get("Authorization")
+    token = resp.cookies.get("TOKEN")
     if not token:
-        csrf = resp.headers.get("X-CSRF-Token", "")
-        if csrf:
-            session.headers["X-CSRF-Token"] = csrf
-        log.info("UniFi login OK (cookie-based session).")
-        return ""
+        raise AuthError("Login succeeded but no TOKEN cookie received.")
 
-    log.info("UniFi login OK (bearer token).")
+    log.info("UniFi login OK (TOKEN cookie obtained).")
     return token
 
 
-def unifi_get_access_key(session: requests.Session, bearer_token: str) -> str:
-    url = f"{UNIFI_BASE_URL}/api/auth/access-key"
-    headers = {}
-    if bearer_token:
-        headers["Authorization"] = f"Bearer {bearer_token}"
-
-    resp = session.post(url, headers=headers, verify=VERIFY_TLS, timeout=15)
-    if resp.status_code in (401, 403):
-        raise AuthError(f"Failed to obtain access key (HTTP {resp.status_code}).")
-    resp.raise_for_status()
-
-    data = resp.json()
-    access_key = data.get("accessKey", "")
-    if not access_key:
-        raise AuthError(f"Empty accessKey in response: {data}")
-
-    log.info("Access key obtained successfully.")
-    return access_key
-
-
 def authenticate_unifi(session: requests.Session) -> str:
-    """Returns an accessKey for video export (credential flow) or empty string (API key flow)."""
+    """Returns TOKEN cookie value (credential flow) or empty string (API key flow)."""
     if use_api_key_auth():
         log.info("Using X-API-Key authentication.")
         return ""
 
-    bearer = unifi_login(session)
-    return unifi_get_access_key(session, bearer)
+    return unifi_login(session)
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +128,7 @@ def build_hour_chunks(hours_back: int):
 
 def download_chunk_mp4(
     session: requests.Session,
-    access_key: str,
+    token: str,
     chunk_start: datetime,
     chunk_end: datetime,
     output_path: Path,
@@ -164,43 +140,67 @@ def download_chunk_mp4(
         "end": int(chunk_end.timestamp() * 1000),
     }
     headers = {}
+    cookies = {}
 
     if use_api_key_auth():
         headers["X-API-Key"] = UNIFI_API_KEY
-    elif access_key:
-        params["accessKey"] = access_key
+    elif token:
+        cookies["TOKEN"] = token
 
+    auth_mode = "api_key" if use_api_key_auth() else "cookie_token"
     log.info(
         "Downloading chunk %s -> %s  (url=%s, camera=%s, auth=%s)",
         chunk_start.isoformat(),
         chunk_end.isoformat(),
         url,
         CAMERA_ID,
-        "api_key" if use_api_key_auth() else "access_key",
+        auth_mode,
     )
     with session.get(
         url,
         headers=headers,
+        cookies=cookies,
         params=params,
         stream=True,
         timeout=(10, 600),
         verify=VERIFY_TLS,
     ) as resp:
         if resp.status_code in (401, 403):
-            body = resp.text[:300]
-            method = "X-API-Key" if use_api_key_auth() else "accessKey (credentials)"
-            log.error(
-                "UniFi API authentication failed (HTTP %s): %s\n"
-                "  Auth method: %s\n"
-                "  Hints:\n"
-                "  - If using API Key: verify it in UniFi OS -> Settings -> Advanced\n"
-                "  - If using credentials: check username/password, user must have Protect access\n"
-                "  - Aborting all remaining chunks.",
-                resp.status_code,
-                body,
-                method,
-            )
-            raise AuthError(f"HTTP {resp.status_code}: {body}")
+            if not use_api_key_auth() and token:
+                log.warning("Token may have expired, re-authenticating...")
+                try:
+                    new_token = unifi_login(session)
+                except AuthError:
+                    raise
+                retry_resp = session.get(
+                    url,
+                    cookies={"TOKEN": new_token},
+                    params=params,
+                    stream=True,
+                    timeout=(10, 600),
+                    verify=VERIFY_TLS,
+                )
+                if retry_resp.status_code < 400:
+                    resp = retry_resp
+                else:
+                    body = retry_resp.text[:300]
+                    log.error("Re-auth failed (HTTP %s): %s", retry_resp.status_code, body)
+                    raise AuthError(f"HTTP {retry_resp.status_code}: {body}")
+            else:
+                body = resp.text[:300]
+                method = "X-API-Key" if use_api_key_auth() else "cookie_token"
+                log.error(
+                    "UniFi API authentication failed (HTTP %s): %s\n"
+                    "  Auth method: %s\n"
+                    "  Hints:\n"
+                    "  - If using API Key: verify it in UniFi OS -> Settings -> Advanced\n"
+                    "  - If using credentials: check username/password, user needs Protect access\n"
+                    "  - Aborting all remaining chunks.",
+                    resp.status_code,
+                    body,
+                    method,
+                )
+                raise AuthError(f"HTTP {resp.status_code}: {body}")
 
         if resp.status_code >= 400:
             log.error("UniFi API error %s: %s", resp.status_code, resp.text[:300])
