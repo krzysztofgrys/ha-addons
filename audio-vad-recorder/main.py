@@ -56,7 +56,7 @@ RECONNECT_DELAY_S = 5
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="[%(asctime)s] %(levelname)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout,
@@ -159,12 +159,18 @@ class SileroVAD:
 
     def __call__(self, audio_chunk: np.ndarray) -> float:
         ort_inputs = {
-            "input": audio_chunk.reshape(1, -1),
+            "input": audio_chunk.reshape(1, -1).astype(np.float32),
             "sr": np.array([SAMPLE_RATE], dtype=np.int64),
             "state": self._state,
         }
         out, self._state = self._session.run(None, ort_inputs)
-        return float(out.squeeze())
+        prob = float(out.squeeze())
+        self._call_count = getattr(self, "_call_count", 0) + 1
+        if self._call_count <= 100 or self._call_count % 300 == 0:
+            log.debug("VAD chunk #%d: prob=%.4f  audio_rms=%.4f",
+                       self._call_count, prob,
+                       float(np.sqrt(np.mean(audio_chunk ** 2))))
+        return prob
 
 
 def load_vad_model() -> SileroVAD:
