@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+import urllib3
 
 
 UNIFI_BASE_URL = os.environ.get("UNIFI_BASE_URL", "").rstrip("/")
@@ -32,6 +33,9 @@ UNIFI_EXPORT_PATH = "/proxy/protect/api/video/export"
 HA_NOTIFY_ENDPOINT = "http://supervisor/core/api/services/persistent_notification/create"
 CHUNK_DURATION = timedelta(hours=1)
 
+
+if not VERIFY_TLS:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,6 +72,10 @@ def build_hour_chunks(hours_back: int):
     return chunks
 
 
+class AuthError(Exception):
+    pass
+
+
 def download_chunk_mp4(
     session: requests.Session, chunk_start: datetime, chunk_end: datetime, output_path: Path
 ) -> bool:
@@ -80,9 +88,11 @@ def download_chunk_mp4(
     headers = {"X-API-Key": UNIFI_API_KEY}
 
     log.info(
-        "Downloading chunk %s -> %s",
+        "Downloading chunk %s -> %s  (url=%s, camera=%s)",
         chunk_start.isoformat(),
         chunk_end.isoformat(),
+        url,
+        CAMERA_ID,
     )
     with session.get(
         url,
@@ -92,6 +102,21 @@ def download_chunk_mp4(
         timeout=(10, 600),
         verify=VERIFY_TLS,
     ) as resp:
+        if resp.status_code in (401, 403):
+            body = resp.text[:300]
+            log.error(
+                "UniFi API authentication failed (HTTP %s): %s\n"
+                "  Hints:\n"
+                "  - Verify your X-API-Key in UniFi OS -> Settings -> Advanced -> API Keys\n"
+                "  - The key must have UniFi Protect permissions\n"
+                "  - Check that unifi_base_url (%s) is correct (UDM uses /proxy/protect/...)\n"
+                "  - Aborting all remaining chunks.",
+                resp.status_code,
+                body,
+                UNIFI_BASE_URL,
+            )
+            raise AuthError(f"HTTP {resp.status_code}: {body}")
+
         if resp.status_code >= 400:
             log.error("UniFi API error %s: %s", resp.status_code, resp.text[:300])
             return False
@@ -101,10 +126,12 @@ def download_chunk_mp4(
                 if piece:
                     f.write(piece)
 
-    if not output_path.exists() or output_path.stat().st_size == 0:
+    size = output_path.stat().st_size if output_path.exists() else 0
+    if size == 0:
         log.warning("Downloaded MP4 is empty for chunk %s", chunk_start.isoformat())
         return False
 
+    log.info("Chunk downloaded: %s (%.1f MB)", output_path.name, size / 1024 / 1024)
     return True
 
 
@@ -238,7 +265,15 @@ def main() -> int:
                 mp4_path = tmp / f"chunk_{i:03d}.mp4"
                 wav_path = tmp / f"chunk_{i:03d}.wav"
 
-                downloaded = download_chunk_mp4(session, chunk_start, chunk_end, mp4_path)
+                try:
+                    downloaded = download_chunk_mp4(session, chunk_start, chunk_end, mp4_path)
+                except AuthError:
+                    send_home_assistant_notification(
+                        message="Autoryzacja UniFi Protect nie powiodla sie (401/403). Sprawdz API Key.",
+                        title="UniFi Protect Error",
+                    )
+                    return 1
+
                 if not downloaded:
                     cleanup_files([mp4_path, wav_path])
                     continue
