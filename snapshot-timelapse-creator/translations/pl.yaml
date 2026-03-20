@@ -1,0 +1,16 @@
+configuration:
+  snapshot_dir:
+    name: Katalog snapshotow
+    description: Sciezka do katalogu ze snapshotami (struktura folderow YYYY-MM).
+  output_dir:
+    name: Katalog wyjsciowy
+    description: Sciezka gdzie beda zapisywane wygenerowane timelapse.
+  file_pattern:
+    name: Wzorzec plikow
+    description: Glob pattern dla plikow (np. *.jpg, *.png).
+  max_threads:
+    name: Max watkow FFmpeg
+    description: Maksymalna liczba watkow CPU do enkodowania (mniej = mniejsze obciazenie serwera).
+  brightness_threshold:
+    name: Prog jasnosci
+    description: Minimalna srednia jasnosc (0-255) aby klatka zostala uzyta. Klatki ponizej progu sa traktowane jako ciemne/nocne.

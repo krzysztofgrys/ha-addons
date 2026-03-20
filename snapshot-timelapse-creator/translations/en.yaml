@@ -1,0 +1,16 @@
+configuration:
+  snapshot_dir:
+    name: Snapshot Directory
+    description: Path to the directory containing snapshot folders (YYYY-MM structure).
+  output_dir:
+    name: Output Directory
+    description: Path where generated timelapse videos will be saved.
+  file_pattern:
+    name: File Pattern
+    description: Glob pattern for snapshot files (e.g. *.jpg, *.png).
+  max_threads:
+    name: Max FFmpeg Threads
+    description: Maximum number of CPU threads for video encoding (lower = less server load).
+  brightness_threshold:
+    name: Brightness Threshold
+    description: Minimum average brightness (0-255) to include a frame. Frames below this are considered dark/night.
