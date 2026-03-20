@@ -13,6 +13,7 @@ export OUTPUT_DIR="$(jq -r '.output_dir // "/share/timelapses"' "$CONFIG")"
 export FILE_PATTERN="$(jq -r '.file_pattern // "*.jpg"' "$CONFIG")"
 export MAX_THREADS="$(jq -r '.max_threads // 2' "$CONFIG")"
 export BRIGHTNESS_THRESHOLD="$(jq -r '.brightness_threshold // 30' "$CONFIG")"
+export NIGHTMODE_THRESHOLD="$(jq -r '.nightmode_threshold // 15' "$CONFIG")"
 
 mkdir -p "$OUTPUT_DIR"
 

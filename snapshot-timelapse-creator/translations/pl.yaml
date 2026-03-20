@@ -13,4 +13,7 @@ configuration:
     description: Maksymalna liczba watkow CPU do enkodowania (mniej = mniejsze obciazenie serwera).
   brightness_threshold:
     name: Prog jasnosci
-    description: Minimalna srednia jasnosc (0-255) aby klatka zostala uzyta. Klatki ponizej progu sa traktowane jako ciemne/nocne.
+    description: Minimalna srednia jasnosc (0-255) aby klatka zostala uzyta. Klatki ponizej progu sa traktowane jako zbyt ciemne.
+  nightmode_threshold:
+    name: Prog trybu nocnego
+    description: Minimalne nasycenie kolorow (0-255) aby klatka zostala uzyta. Klatki z trybu nocnego/IR sa prawie szare i beda ponizej tego progu.

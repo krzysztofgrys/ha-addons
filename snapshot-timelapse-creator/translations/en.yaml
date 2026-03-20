@@ -13,4 +13,7 @@ configuration:
     description: Maximum number of CPU threads for video encoding (lower = less server load).
   brightness_threshold:
     name: Brightness Threshold
-    description: Minimum average brightness (0-255) to include a frame. Frames below this are considered dark/night.
+    description: Minimum average brightness (0-255) to include a frame. Frames below this are considered too dark.
+  nightmode_threshold:
+    name: Night Mode Threshold
+    description: Minimum color saturation (0-255) to include a frame. IR/night vision frames are near-grayscale and will be below this threshold.

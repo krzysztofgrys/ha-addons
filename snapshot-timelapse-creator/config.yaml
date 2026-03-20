@@ -1,5 +1,5 @@
 name: "Snapshot Timelapse Creator"
-version: "1.0.2"
+version: "1.1.0"
 slug: "snapshot_timelapse_creator"
 description: "Create timelapse videos from camera snapshots with dark frame detection and corruption filtering."
 url: "https://github.com/krzysztofgrys/ha-addons"
@@ -21,9 +21,11 @@ options:
   file_pattern: "*.jpg"
   max_threads: 2
   brightness_threshold: 30
+  nightmode_threshold: 15
 schema:
   snapshot_dir: str
   output_dir: str
   file_pattern: str
   max_threads: "int(1,8)"
   brightness_threshold: "int(0,255)"
+  nightmode_threshold: "int(0,255)"

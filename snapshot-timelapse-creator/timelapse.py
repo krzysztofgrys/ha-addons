@@ -155,6 +155,37 @@ def get_brightness(path: Path) -> int:
         return 128
 
 
+def get_saturation(path: Path) -> float:
+    """Average color saturation 0-255 via 8x8 RGB downscale.
+
+    IR/night-mode frames are near-grayscale (R~G~B) even when bright,
+    so saturation is close to 0.  Daytime frames have much higher values.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-v", "error",
+                "-i", str(path),
+                "-vf", "scale=8:8",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode != 0 or len(result.stdout) < 3:
+            return 128.0
+        pixels = result.stdout
+        total = 0.0
+        count = 0
+        for i in range(0, len(pixels) - 2, 3):
+            r, g, b = pixels[i], pixels[i + 1], pixels[i + 2]
+            total += max(r, g, b) - min(r, g, b)
+            count += 1
+        return total / count if count else 128.0
+    except Exception:
+        return 128.0
+
+
 def generate_thumbnail(src: Path, dst: Path, size: int = 200) -> bool:
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -191,6 +222,8 @@ class TimelapseJob:
         self.processed_frames = 0
         self.skipped_corrupt = 0
         self.skipped_dark = 0
+        self.skipped_nightmode = 0
+        self.skipped_sampling = 0
         self.used_frames = 0
         self.message = ""
         self.output_file: Optional[str] = None
@@ -219,6 +252,8 @@ class TimelapseJob:
             "processed_frames": self.processed_frames,
             "skipped_corrupt": self.skipped_corrupt,
             "skipped_dark": self.skipped_dark,
+            "skipped_nightmode": self.skipped_nightmode,
+            "skipped_sampling": self.skipped_sampling,
             "used_frames": self.used_frames,
             "message": self.message,
             "output_file": self.output_file,
@@ -269,6 +304,8 @@ def generate_timelapse(
     max_threads: int = 2,
     skip_dark: bool = False,
     brightness_threshold: int = 30,
+    skip_night: bool = False,
+    nightmode_threshold: int = 15,
     skip_every: int = 1,
 ) -> bool:
     width = RESOLUTION_MAP.get(resolution, 1280)
@@ -289,6 +326,7 @@ def generate_timelapse(
         job.progress = int((i + 1) / len(images) * 50)
 
         if skip_every > 1 and (i % skip_every) != 0:
+            job.skipped_sampling += 1
             continue
 
         if not validate_image(img):
@@ -299,6 +337,12 @@ def generate_timelapse(
             brightness = get_brightness(img)
             if brightness < brightness_threshold:
                 job.skipped_dark += 1
+                continue
+
+        if skip_night:
+            saturation = get_saturation(img)
+            if saturation < nightmode_threshold:
+                job.skipped_nightmode += 1
                 continue
 
         valid_images.append(img)
@@ -386,6 +430,8 @@ def generate_preview(
     max_threads: int = 2,
     skip_dark: bool = False,
     brightness_threshold: int = 30,
+    skip_night: bool = False,
+    nightmode_threshold: int = 15,
     max_frames: int = 200,
 ) -> bool:
     skip_every = max(1, len(images) // max_frames)
@@ -398,6 +444,8 @@ def generate_preview(
         max_threads=max_threads,
         skip_dark=skip_dark,
         brightness_threshold=brightness_threshold,
+        skip_night=skip_night,
+        nightmode_threshold=nightmode_threshold,
         skip_every=skip_every,
     )
 

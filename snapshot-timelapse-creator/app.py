@@ -27,6 +27,7 @@ OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/share/timelapses"))
 FILE_PATTERN = os.environ.get("FILE_PATTERN", "*.jpg")
 MAX_THREADS = int(os.environ.get("MAX_THREADS", "2"))
 BRIGHTNESS_THRESHOLD = int(os.environ.get("BRIGHTNESS_THRESHOLD", "30"))
+NIGHTMODE_THRESHOLD = int(os.environ.get("NIGHTMODE_THRESHOLD", "15"))
 THUMB_DIR = Path("/data/.thumbs")
 
 app = Flask(__name__)
@@ -46,6 +47,7 @@ def index():
         months=scan_months(SNAPSHOT_DIR),
         resolutions=list(RESOLUTION_MAP.keys()),
         brightness_threshold=BRIGHTNESS_THRESHOLD,
+        nightmode_threshold=NIGHTMODE_THRESHOLD,
     )
 
 
@@ -170,6 +172,7 @@ def api_generate():
     resolution = data.get("resolution", "720p")
     target_duration = int(data.get("target_duration", 0))
     skip_dark = bool(data.get("skip_dark", False))
+    skip_night = bool(data.get("skip_night", False))
     is_preview = bool(data.get("preview", False))
 
     if not date_from or not date_to:
@@ -195,6 +198,7 @@ def api_generate():
                     images, out_path, job,
                     fps=fps, max_threads=MAX_THREADS,
                     skip_dark=skip_dark, brightness_threshold=BRIGHTNESS_THRESHOLD,
+                    skip_night=skip_night, nightmode_threshold=NIGHTMODE_THRESHOLD,
                 )
             else:
                 skip_every = 1
@@ -207,6 +211,7 @@ def api_generate():
                     images, out_path, job,
                     fps=fps, resolution=resolution, max_threads=MAX_THREADS,
                     skip_dark=skip_dark, brightness_threshold=BRIGHTNESS_THRESHOLD,
+                    skip_night=skip_night, nightmode_threshold=NIGHTMODE_THRESHOLD,
                     skip_every=skip_every,
                 )
         except Exception as exc:
@@ -478,8 +483,12 @@ input[type=checkbox] { width: auto; margin-right: 6px; }
     </div>
   </div>
   <div class="checkbox-row">
-    <input type="checkbox" id="skip-dark" checked>
-    <span>Pomin ciemne klatki (nocne) - prog jasnosci: {{ brightness_threshold }}</span>
+    <input type="checkbox" id="skip-dark">
+    <span>Pomin ciemne klatki (jasnosc &lt; {{ brightness_threshold }})</span>
+  </div>
+  <div class="checkbox-row">
+    <input type="checkbox" id="skip-night" checked>
+    <span>Pomin tryb nocny / IR (wykrywa szare klatki z kamery na podczerwien)</span>
   </div>
   <div id="calc-info" style="margin-top:10px; font-size:.8rem; color:var(--muted)"></div>
   <div style="margin-top:16px; display:flex; gap:8px;">
@@ -615,6 +624,7 @@ async function doGenerate(preview) {
     resolution: document.getElementById('resolution').value,
     target_duration: parseInt(document.getElementById('target-duration').value) || 0,
     skip_dark: document.getElementById('skip-dark').checked,
+    skip_night: document.getElementById('skip-night').checked,
     preview: preview,
   };
 
@@ -654,8 +664,10 @@ async function pollJob() {
 
   document.getElementById('progress-stats').innerHTML = `
     <span>Przetworzonych: <span class="val">${j.processed_frames}/${j.total_frames}</span></span>
-    <span>Uszkodzonych: <span class="val">${j.skipped_corrupt}</span></span>
-    <span>Ciemnych: <span class="val">${j.skipped_dark}</span></span>
+    ${j.skipped_corrupt > 0 ? `<span>Uszkodzonych: <span class="val">${j.skipped_corrupt}</span></span>` : ''}
+    ${j.skipped_dark > 0 ? `<span>Ciemnych: <span class="val">${j.skipped_dark}</span></span>` : ''}
+    ${j.skipped_nightmode > 0 ? `<span>Tryb nocny: <span class="val">${j.skipped_nightmode}</span></span>` : ''}
+    ${j.skipped_sampling > 0 ? `<span>Sampling: <span class="val">co ${Math.round(j.total_frames / (j.used_frames || 1))}.</span></span>` : ''}
     <span>Uzytych: <span class="val">${j.used_frames}</span></span>
   `;
 
