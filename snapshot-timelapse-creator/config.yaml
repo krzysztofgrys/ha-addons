@@ -1,5 +1,5 @@
 name: "Snapshot Timelapse Creator"
-version: "1.0.1"
+version: "1.0.2"
 slug: "snapshot_timelapse_creator"
 description: "Create timelapse videos from camera snapshots with dark frame detection and corruption filtering."
 url: "https://github.com/krzysztofgrys/ha-addons"
@@ -13,7 +13,7 @@ ingress_port: 8099
 panel_icon: "mdi:timelapse"
 panel_title: "Timelapse Creator"
 map:
-  - homeassistant:ro
+  - homeassistant_config:ro
   - share:rw
 options:
   snapshot_dir: "/homeassistant/timelapse"
