@@ -1,5 +1,5 @@
 name: "Snapshot Timelapse Creator"
-version: "1.0.0"
+version: "1.0.1"
 slug: "snapshot_timelapse_creator"
 description: "Create timelapse videos from camera snapshots with dark frame detection and corruption filtering."
 url: "https://github.com/krzysztofgrys/ha-addons"

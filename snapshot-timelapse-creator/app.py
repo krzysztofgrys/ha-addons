@@ -9,6 +9,7 @@ from flask import Flask, jsonify, render_template_string, request, send_file
 from timelapse import (
     RESOLUTION_MAP,
     TimelapseJob,
+    _get_file_datetime,
     count_snapshots,
     generate_preview,
     generate_thumbnail,
@@ -57,6 +58,32 @@ def api_months():
     return jsonify({"months": scan_months(SNAPSHOT_DIR)})
 
 
+@app.route("/api/debug")
+def api_debug():
+    """Diagnostic endpoint for troubleshooting path/scanning issues."""
+    exists = SNAPSHOT_DIR.exists()
+    months = scan_months(SNAPSHOT_DIR) if exists else []
+    sample_files = []
+    if months:
+        first_month = SNAPSHOT_DIR / months[0]
+        for i, f in enumerate(first_month.glob(FILE_PATTERN)):
+            if i >= 5:
+                break
+            dt = _get_file_datetime(f)
+            sample_files.append({
+                "name": f.name,
+                "parsed_datetime": dt.strftime("%Y-%m-%d %H:%M") if dt else None,
+                "size_bytes": f.stat().st_size,
+            })
+    return jsonify({
+        "snapshot_dir": str(SNAPSHOT_DIR),
+        "snapshot_dir_exists": exists,
+        "file_pattern": FILE_PATTERN,
+        "months_found": months,
+        "sample_files_from_first_month": sample_files,
+    })
+
+
 @app.route("/api/stats")
 def api_stats():
     date_from = request.args.get("from", "")
@@ -93,12 +120,14 @@ def api_samples():
 
     items = []
     for s in samples:
-        mtime = datetime.fromtimestamp(s.stat().st_mtime)
-        month = mtime.strftime("%Y-%m")
+        dt = _get_file_datetime(s)
+        if dt is None:
+            dt = datetime.fromtimestamp(s.stat().st_mtime)
+        month = dt.strftime("%Y-%m")
         items.append({
             "month": month,
             "filename": s.name,
-            "datetime": mtime.strftime("%Y-%m-%d %H:%M"),
+            "datetime": dt.strftime("%Y-%m-%d %H:%M"),
         })
     return jsonify({"samples": items, "total": len(all_snaps)})
 

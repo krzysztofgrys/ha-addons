@@ -6,19 +6,51 @@ import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 log = logging.getLogger(__name__)
+
+FILENAME_PATTERNS = [
+    re.compile(r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})"),   # YYYYMMDD_HHMM
+    re.compile(r"(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})"), # YYYY-MM-DD_HH-MM
+    re.compile(r"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})"),     # YYYYMMDDHHMM
+    re.compile(r"(\d{4})-(\d{2})-(\d{2})_(\d{2})(\d{2})"),  # YYYY-MM-DD_HHMM
+]
+
+
+def _parse_datetime_from_filename(name: str) -> Optional[datetime]:
+    for pattern in FILENAME_PATTERNS:
+        m = pattern.search(name)
+        if m:
+            try:
+                y, mo, d, h, mi = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))
+                return datetime(y, mo, d, h, mi)
+            except (ValueError, IndexError):
+                continue
+    return None
+
+
+def _get_file_datetime(path: Path) -> Optional[datetime]:
+    dt = _parse_datetime_from_filename(path.name)
+    if dt:
+        return dt
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return None
 
 
 def scan_months(base_dir: Path) -> List[str]:
     if not base_dir.exists():
+        log.warning("Snapshot dir does not exist: %s", base_dir)
         return []
     months = []
     for entry in os.scandir(base_dir):
         if entry.is_dir() and re.match(r"\d{4}-\d{2}$", entry.name):
             months.append(entry.name)
-    return sorted(months)
+    result = sorted(months)
+    log.info("Found %d month folders in %s: %s", len(result), base_dir, result)
+    return result
 
 
 def scan_snapshots(
@@ -35,19 +67,44 @@ def scan_snapshots(
     from_month = from_date.strftime("%Y-%m")
     to_month = to_date.strftime("%Y-%m")
     relevant_months = [m for m in scan_months(base_dir) if from_month <= m <= to_month]
+    log.info(
+        "Scanning: %s -> %s (months: %s), hours %d-%d, pattern: %s",
+        date_from, date_to, relevant_months, hour_from, hour_to, file_pattern,
+    )
 
-    snapshots = []
+    snapshots: List[Tuple[float, Path]] = []
+    total_files = 0
+    skipped_no_date = 0
+    skipped_date_range = 0
+    skipped_hour_range = 0
+
     for month in relevant_months:
         month_dir = base_dir / month
         for f in month_dir.glob(file_pattern):
             if not f.is_file():
                 continue
-            try:
-                mtime = datetime.fromtimestamp(f.stat().st_mtime)
-            except OSError:
+            total_files += 1
+
+            dt = _get_file_datetime(f)
+            if dt is None:
+                skipped_no_date += 1
                 continue
-            if from_date <= mtime.date() <= to_date and hour_from <= mtime.hour < hour_to:
-                snapshots.append((mtime.timestamp(), f))
+
+            if not (from_date <= dt.date() <= to_date):
+                skipped_date_range += 1
+                continue
+
+            if not (hour_from <= dt.hour < hour_to):
+                skipped_hour_range += 1
+                continue
+
+            snapshots.append((dt.timestamp(), f))
+
+    log.info(
+        "Scan result: %d files found, %d matched, %d skipped (no_date=%d, date_range=%d, hour=%d)",
+        total_files, len(snapshots), skipped_no_date + skipped_date_range + skipped_hour_range,
+        skipped_no_date, skipped_date_range, skipped_hour_range,
+    )
 
     snapshots.sort(key=lambda x: x[0])
     return [p for _, p in snapshots]
