@@ -1,12 +1,14 @@
+import json
 import logging
 import os
 import re
 import subprocess
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -121,47 +123,45 @@ def count_snapshots(
     return len(scan_snapshots(base_dir, file_pattern, date_from, date_to, hour_from, hour_to))
 
 
-def validate_image(path: Path) -> bool:
+CACHE_PATH = Path("/data/.validation_cache.json")
+_PARALLEL_WORKERS = 4
+
+
+def _cache_key(path: Path) -> str:
     try:
-        if path.stat().st_size < 1000:
-            return False
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", str(path)],
-            capture_output=True,
-            timeout=5,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
+        st = path.stat()
+        return f"{path.name}:{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        return path.name
 
 
-def get_brightness(path: Path) -> int:
-    """Average brightness 0-255 via 1x1 grayscale downscale."""
+def _load_cache() -> Dict:
+    if CACHE_PATH.exists():
+        try:
+            return json.loads(CACHE_PATH.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_cache(cache: Dict) -> None:
     try:
-        result = subprocess.run(
-            [
-                "ffmpeg", "-v", "error",
-                "-i", str(path),
-                "-vf", "scale=1:1",
-                "-f", "rawvideo", "-pix_fmt", "gray", "-",
-            ],
-            capture_output=True,
-            timeout=10,
-        )
-        if result.returncode == 0 and len(result.stdout) >= 1:
-            return result.stdout[0]
-        return 128
+        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_PATH.write_text(json.dumps(cache))
     except Exception:
-        return 128
+        log.warning("Failed to save validation cache")
 
 
-def get_saturation(path: Path) -> float:
-    """Average color saturation 0-255 via 8x8 RGB downscale.
+def check_image(path: Path) -> Dict:
+    """Single ffmpeg call: validate + brightness + saturation.
 
-    IR/night-mode frames are near-grayscale (R~G~B) even when bright,
-    so saturation is close to 0.  Daytime frames have much higher values.
+    Produces an 8x8 RGB thumbnail.  If ffmpeg succeeds the file is valid.
+    Brightness and saturation are computed from the 192 output bytes.
     """
     try:
+        if path.stat().st_size < 1000:
+            return {"valid": False, "brightness": 0, "saturation": 0.0}
+
         result = subprocess.run(
             [
                 "ffmpeg", "-v", "error",
@@ -172,18 +172,27 @@ def get_saturation(path: Path) -> float:
             capture_output=True,
             timeout=10,
         )
+
         if result.returncode != 0 or len(result.stdout) < 3:
-            return 128.0
+            return {"valid": False, "brightness": 0, "saturation": 0.0}
+
         pixels = result.stdout
-        total = 0.0
+        total_brightness = 0
+        total_saturation = 0.0
         count = 0
         for i in range(0, len(pixels) - 2, 3):
             r, g, b = pixels[i], pixels[i + 1], pixels[i + 2]
-            total += max(r, g, b) - min(r, g, b)
+            total_brightness += (r + g + b) // 3
+            total_saturation += max(r, g, b) - min(r, g, b)
             count += 1
-        return total / count if count else 128.0
+
+        return {
+            "valid": True,
+            "brightness": total_brightness // count if count else 0,
+            "saturation": round(total_saturation / count, 1) if count else 0.0,
+        }
     except Exception:
-        return 128.0
+        return {"valid": False, "brightness": 0, "saturation": 0.0}
 
 
 def generate_thumbnail(src: Path, dst: Path, size: int = 200) -> bool:
@@ -325,38 +334,73 @@ def generate_timelapse(
     job.total_frames = len(images)
     job.message = "Walidacja i filtrowanie klatek..."
 
-    valid_images: List[Path] = []
-
+    # Build list of candidates after pre-sampling
+    candidates: List[Tuple[int, Path]] = []
     for i, img in enumerate(images):
-        if job.is_cancelled:
-            job.status = "cancelled"
-            job.message = "Anulowane"
-            return False
-
-        job.processed_frames = i + 1
-        job.progress = int((i + 1) / len(images) * 50)
-
         if pre_sample > 1 and (i % pre_sample) != 0:
             job.skipped_sampling += 1
             continue
+        candidates.append((i, img))
 
-        if not validate_image(img):
+    # Load cache, split into cached vs to-check
+    cache = _load_cache()
+    check_results: Dict[int, Dict] = {}
+    to_check: List[Tuple[int, Path]] = []
+    for i, img in candidates:
+        key = _cache_key(img)
+        if key in cache:
+            check_results[i] = cache[key]
+        else:
+            to_check.append((i, img))
+
+    job.message = f"Walidacja {len(to_check)} klatek ({len(check_results)} z cache)..."
+    log.info(
+        "Validation: %d candidates, %d cached, %d to check",
+        len(candidates), len(check_results), len(to_check),
+    )
+
+    # Parallel validation for uncached images
+    if to_check:
+        done_count = len(check_results)
+        total_to_process = len(candidates)
+        with ThreadPoolExecutor(max_workers=_PARALLEL_WORKERS) as executor:
+            futures = {
+                executor.submit(check_image, img): (i, img)
+                for i, img in to_check
+            }
+            for future in as_completed(futures):
+                if job.is_cancelled:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    job.status = "cancelled"
+                    job.message = "Anulowane"
+                    return False
+
+                idx, img = futures[future]
+                result = future.result()
+                check_results[idx] = result
+                cache[_cache_key(img)] = result
+
+                done_count += 1
+                job.processed_frames = done_count
+                job.progress = int(done_count / total_to_process * 50)
+
+        _save_cache(cache)
+    else:
+        job.processed_frames = len(candidates)
+        job.progress = 50
+
+    # Apply filters on check results (in original order)
+    valid_images: List[Path] = []
+    for i, img in candidates:
+        r = check_results.get(i)
+        if not r or not r["valid"]:
             job.skipped_corrupt += 1
-            continue
-
-        if skip_dark:
-            brightness = get_brightness(img)
-            if brightness < brightness_threshold:
-                job.skipped_dark += 1
-                continue
-
-        if skip_night:
-            saturation = get_saturation(img)
-            if saturation < nightmode_threshold:
-                job.skipped_nightmode += 1
-                continue
-
-        valid_images.append(img)
+        elif skip_dark and r["brightness"] < brightness_threshold:
+            job.skipped_dark += 1
+        elif skip_night and r["saturation"] < nightmode_threshold:
+            job.skipped_nightmode += 1
+        else:
+            valid_images.append(img)
 
     if not valid_images:
         job.status = "error"
@@ -365,9 +409,10 @@ def generate_timelapse(
 
     # Final sampling: trim valid frames to exact target
     if target_frames > 0 and len(valid_images) > target_frames:
+        trimmed = len(valid_images) - target_frames
         step = len(valid_images) / target_frames
         valid_images = [valid_images[int(i * step)] for i in range(target_frames)]
-        job.skipped_sampling += (job.used_frames or 0)  # already counted above
+        job.skipped_sampling += trimmed
 
     job.used_frames = len(valid_images)
     job.message = f"Generowanie timelapse z {len(valid_images)} klatek..."
