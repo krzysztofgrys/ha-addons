@@ -306,9 +306,20 @@ def generate_timelapse(
     brightness_threshold: int = 30,
     skip_night: bool = False,
     nightmode_threshold: int = 15,
-    skip_every: int = 1,
+    target_frames: int = 0,
 ) -> bool:
     width = RESOLUTION_MAP.get(resolution, 1280)
+    needs_filtering = skip_dark or skip_night
+
+    # Pre-filter sampling: check more frames than we need to account for
+    # rejection by dark/night filters.  If no filters are active we can
+    # sample exactly.  With filters we check ~4x target so that even a
+    # 75 % rejection rate still yields enough frames.
+    pre_sample = 1
+    if target_frames > 0:
+        pool = target_frames * 4 if needs_filtering else target_frames
+        if len(images) > pool:
+            pre_sample = max(1, len(images) // pool)
 
     job.status = "validating"
     job.total_frames = len(images)
@@ -325,7 +336,7 @@ def generate_timelapse(
         job.processed_frames = i + 1
         job.progress = int((i + 1) / len(images) * 50)
 
-        if skip_every > 1 and (i % skip_every) != 0:
+        if pre_sample > 1 and (i % pre_sample) != 0:
             job.skipped_sampling += 1
             continue
 
@@ -351,6 +362,12 @@ def generate_timelapse(
         job.status = "error"
         job.error = "Brak prawidlowych klatek po filtrowaniu"
         return False
+
+    # Final sampling: trim valid frames to exact target
+    if target_frames > 0 and len(valid_images) > target_frames:
+        step = len(valid_images) / target_frames
+        valid_images = [valid_images[int(i * step)] for i in range(target_frames)]
+        job.skipped_sampling += (job.used_frames or 0)  # already counted above
 
     job.used_frames = len(valid_images)
     job.message = f"Generowanie timelapse z {len(valid_images)} klatek..."
@@ -434,7 +451,6 @@ def generate_preview(
     nightmode_threshold: int = 15,
     max_frames: int = 200,
 ) -> bool:
-    skip_every = max(1, len(images) // max_frames)
     return generate_timelapse(
         images=images,
         output_path=output_path,
@@ -446,7 +462,7 @@ def generate_preview(
         brightness_threshold=brightness_threshold,
         skip_night=skip_night,
         nightmode_threshold=nightmode_threshold,
-        skip_every=skip_every,
+        target_frames=max_frames,
     )
 
 

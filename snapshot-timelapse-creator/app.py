@@ -201,18 +201,14 @@ def api_generate():
                     skip_night=skip_night, nightmode_threshold=NIGHTMODE_THRESHOLD,
                 )
             else:
-                skip_every = 1
-                if target_duration > 0:
-                    needed = target_duration * fps
-                    if len(images) > needed:
-                        skip_every = max(1, len(images) // needed)
+                target_frames = target_duration * fps if target_duration > 0 else 0
 
                 generate_timelapse(
                     images, out_path, job,
                     fps=fps, resolution=resolution, max_threads=MAX_THREADS,
                     skip_dark=skip_dark, brightness_threshold=BRIGHTNESS_THRESHOLD,
                     skip_night=skip_night, nightmode_threshold=NIGHTMODE_THRESHOLD,
-                    skip_every=skip_every,
+                    target_frames=target_frames,
                 )
         except Exception as exc:
             log.exception("Job failed")
