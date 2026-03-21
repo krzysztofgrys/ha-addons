@@ -1,0 +1,28 @@
+configuration:
+  city_name:
+    name: City Name
+    description: City name for Tauron outage lookup (e.g. Wroclaw, Krakow).
+  street_name:
+    name: Street Name
+    description: Your street name for address matching (e.g. Kuźnicza, Rynek).
+  house_number:
+    name: House Number
+    description: Your house/building number for precise Tauron lookup.
+  check_interval:
+    name: Check Interval (minutes)
+    description: How often to poll utility APIs for new outages (5-120 minutes).
+  enable_tauron:
+    name: Enable Tauron (Power)
+    description: Monitor planned and emergency power outages from Tauron Dystrybucja.
+  enable_mpwik:
+    name: Enable MPWiK (Water)
+    description: Monitor water failures and maintenance from MPWiK Wroclaw.
+  notify_mobile:
+    name: Mobile Notifications
+    description: Send push notifications to your phone(s) when new outages are detected.
+  mobile_notify_services:
+    name: Mobile Notify Services
+    description: Comma-separated list of HA notify service names (e.g. mobile_app_phone,mobile_app_tablet).
+  notify_persistent:
+    name: Persistent Notifications
+    description: Create persistent notifications in the Home Assistant dashboard.

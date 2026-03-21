@@ -1,0 +1,38 @@
+name: "Utility Outage Monitor"
+version: "1.0.0"
+slug: "utility_outage_monitor"
+description: "Monitors planned and emergency power (Tauron) and water (MPWiK) outages for your address. Web UI dashboard with history, statistics, and mobile push notifications."
+url: "https://github.com/krzysztofgrys/ha-addons"
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: auto
+hassio_api: true
+homeassistant_api: true
+ingress: true
+ingress_port: 8099
+panel_icon: "mdi:flash-alert"
+panel_title: "Outage Monitor"
+map:
+  - share:rw
+options:
+  city_name: "Wroclaw"
+  street_name: ""
+  house_number: ""
+  check_interval: 30
+  enable_tauron: true
+  enable_mpwik: true
+  notify_mobile: true
+  mobile_notify_services: "mobile_app_phone"
+  notify_persistent: true
+schema:
+  city_name: str
+  street_name: str
+  house_number: str
+  check_interval: "int(5,120)"
+  enable_tauron: bool
+  enable_mpwik: bool
+  notify_mobile: bool
+  mobile_notify_services: str
+  notify_persistent: bool

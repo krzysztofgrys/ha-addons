@@ -1,0 +1,28 @@
+configuration:
+  city_name:
+    name: Nazwa miasta
+    description: Miasto do wyszukiwania wylaczen Tauron (np. Wroclaw, Krakow).
+  street_name:
+    name: Nazwa ulicy
+    description: Twoja ulica do dopasowywania alertow (np. Kuźnicza, Rynek).
+  house_number:
+    name: Numer domu
+    description: Numer budynku do dokladnego wyszukiwania w Tauron.
+  check_interval:
+    name: Interwat sprawdzania (minuty)
+    description: Jak czesto odpytywac API dostawcow mediow (5-120 minut).
+  enable_tauron:
+    name: Wlacz Tauron (prad)
+    description: Monitoruj planowane i awaryjne wylaczenia pradu z Tauron Dystrybucja.
+  enable_mpwik:
+    name: Wlacz MPWiK (woda)
+    description: Monitoruj awarie i prace serwisowe wodociagow MPWiK Wroclaw.
+  notify_mobile:
+    name: Powiadomienia na telefon
+    description: Wyslij push na telefon(y) gdy wykryte zostana nowe wylaczenia.
+  mobile_notify_services:
+    name: Uslugi powiadomien
+    description: Lista uslug notify HA oddzielona przecinkami (np. mobile_app_telefon,mobile_app_tablet).
+  notify_persistent:
+    name: Powiadomienia w HA
+    description: Tworzenie trwalych powiadomien w panelu Home Assistant.
