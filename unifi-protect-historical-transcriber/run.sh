@@ -24,6 +24,7 @@ export KEEP_AUDIO_FILES="$(jq -r '.keep_audio_files // true' "$CONFIG")"
 export SILENCE_THRESHOLD_DB="$(jq -r '.silence_threshold_db // "-40dB"' "$CONFIG")"
 export START_SILENCE_DURATION="$(jq -r '.start_silence_duration // 0.2' "$CONFIG")"
 export STOP_SILENCE_DURATION="$(jq -r '.stop_silence_duration // 0.5' "$CONFIG")"
+export CHUNK_COOLDOWN="$(jq -r '.chunk_cooldown // 5' "$CONFIG")"
 export VERIFY_TLS="$(jq -r '.verify_tls // false' "$CONFIG")"
 
 echo "[INFO] Starting UniFi Protect Historical Transcriber (Web UI)"

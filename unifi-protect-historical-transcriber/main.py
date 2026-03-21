@@ -14,6 +14,7 @@ import urllib3
 MAX_RETRIES = 3
 RETRY_DELAY_S = 10
 READ_TIMEOUT_S = 1200
+CHUNK_COOLDOWN_S = int(os.environ.get("CHUNK_COOLDOWN", "5"))
 
 
 UNIFI_BASE_URL = os.environ.get("UNIFI_BASE_URL", "").rstrip("/")
@@ -539,6 +540,10 @@ def run_pipeline(
                         cleanup_files([wav_tmp])
                     cleanup_files([mp4_path])
                     _chunk("downloaded", label=label)
+
+                    if i < len(chunks):
+                        _status(f"Cooldown {CHUNK_COOLDOWN_S}s (letting UDM breathe)...")
+                        time.sleep(CHUNK_COOLDOWN_S)
 
                 _chunk("done")
                 if skipped:
