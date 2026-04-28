@@ -6,6 +6,15 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request, send_file
 
+from storage import (
+    CleanupJob,
+    cleanup_archive,
+    cleanup_compress,
+    cleanup_delete,
+    get_storage_overview,
+    list_archives,
+    preview_cleanup,
+)
 from timelapse import (
     RESOLUTION_MAP,
     TimelapseJob,
@@ -24,6 +33,7 @@ log = logging.getLogger(__name__)
 
 SNAPSHOT_DIR = Path(os.environ.get("SNAPSHOT_DIR", "/homeassistant/timelapse"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/share/timelapses"))
+ARCHIVE_DIR = Path(os.environ.get("ARCHIVE_DIR", "/share/timelapse_archives"))
 FILE_PATTERN = os.environ.get("FILE_PATTERN", "*.jpg")
 MAX_THREADS = int(os.environ.get("MAX_THREADS", "2"))
 BRIGHTNESS_THRESHOLD = int(os.environ.get("BRIGHTNESS_THRESHOLD", "30"))
@@ -34,6 +44,9 @@ app = Flask(__name__)
 
 job_lock = threading.Lock()
 current_job: TimelapseJob | None = None
+
+cleanup_lock = threading.Lock()
+current_cleanup: CleanupJob | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +175,11 @@ def api_generate():
     with job_lock:
         if current_job and current_job.status in ("validating", "generating"):
             return jsonify({"error": "Job already running"}), 409
+    with cleanup_lock:
+        if current_cleanup and current_cleanup.status in ("pending", "running"):
+            return jsonify({
+                "error": "Trwa sprzatanie pamieci - poczekaj az sie zakonczy"
+            }), 409
 
     data = request.get_json(force=True)
     date_from = data.get("from", "")
@@ -183,6 +201,13 @@ def api_generate():
         return jsonify({"error": "No snapshots found for this range"}), 404
 
     job = TimelapseJob()
+    job.source_range = {
+        "from": date_from,
+        "to": date_to,
+        "hour_from": hour_from,
+        "hour_to": hour_to,
+        "preview": is_preview,
+    }
     with job_lock:
         current_job = job
 
@@ -225,7 +250,9 @@ def api_job_status():
     with job_lock:
         if current_job is None:
             return jsonify({"job": None})
-        return jsonify({"job": current_job.to_dict()})
+        data = current_job.to_dict()
+        data["source_range"] = getattr(current_job, "source_range", None)
+        return jsonify({"job": data})
 
 
 @app.route("/api/job/cancel", methods=["POST"])
@@ -275,6 +302,135 @@ def api_stream(filename):
 def api_delete(filename):
     path = OUTPUT_DIR / filename
     if path.exists():
+        path.unlink()
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# API: storage management
+# ---------------------------------------------------------------------------
+
+@app.route("/api/storage")
+def api_storage():
+    overview = get_storage_overview(SNAPSHOT_DIR, FILE_PATTERN)
+    overview["snapshot_dir"] = str(SNAPSHOT_DIR)
+    overview["archive_dir"] = str(ARCHIVE_DIR)
+    overview["archives"] = list_archives(ARCHIVE_DIR)
+    return jsonify(overview)
+
+
+@app.route("/api/storage/preview")
+def api_storage_preview():
+    date_from = request.args.get("from", "")
+    date_to = request.args.get("to", "")
+    hour_from = int(request.args.get("hour_from", 0))
+    hour_to = int(request.args.get("hour_to", 24))
+
+    if not date_from or not date_to:
+        return jsonify({"error": "from and to are required"}), 400
+
+    info = preview_cleanup(SNAPSHOT_DIR, FILE_PATTERN, date_from, date_to, hour_from, hour_to)
+    return jsonify(info)
+
+
+@app.route("/api/storage/cleanup", methods=["POST"])
+def api_storage_cleanup():
+    global current_cleanup
+
+    with cleanup_lock:
+        if current_cleanup and current_cleanup.status in ("pending", "running"):
+            return jsonify({"error": "Cleanup already running"}), 409
+
+    with job_lock:
+        if current_job and current_job.status in ("validating", "generating"):
+            return jsonify({
+                "error": "Nie mozna sprzatac w trakcie generowania timelapse"
+            }), 409
+
+    data = request.get_json(force=True) or {}
+    action = data.get("action", "")
+    if action not in ("delete", "archive", "compress"):
+        return jsonify({"error": "Invalid action (delete|archive|compress)"}), 400
+
+    date_from = data.get("from", "")
+    date_to = data.get("to", "")
+    hour_from = int(data.get("hour_from", 0))
+    hour_to = int(data.get("hour_to", 24))
+    if not date_from or not date_to:
+        return jsonify({"error": "from and to required"}), 400
+
+    files = scan_snapshots(SNAPSHOT_DIR, FILE_PATTERN, date_from, date_to, hour_from, hour_to)
+    if not files:
+        return jsonify({"error": "Brak plikow do przetworzenia w tym zakresie"}), 404
+
+    job = CleanupJob(action=action)
+    with cleanup_lock:
+        current_cleanup = job
+
+    def _run():
+        try:
+            if action == "delete":
+                cleanup_delete(files, job)
+            elif action == "archive":
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                name = f"snapshots_{date_from}_{date_to}_{ts}"
+                delete_after = bool(data.get("delete_after", True))
+                cleanup_archive(
+                    files=files,
+                    archive_dir=ARCHIVE_DIR,
+                    archive_name=name,
+                    base_dir=SNAPSHOT_DIR,
+                    job=job,
+                    delete_after=delete_after,
+                )
+            elif action == "compress":
+                quality = int(data.get("quality", 70))
+                max_width = int(data.get("max_width", 0))
+                cleanup_compress(files, job, quality=quality, max_width=max_width)
+        except Exception as exc:
+            log.exception("Cleanup job failed")
+            job.status = "error"
+            job.error = str(exc)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jsonify({"ok": True, "job_id": job.id})
+
+
+@app.route("/api/storage/cleanup/status")
+def api_cleanup_status():
+    with cleanup_lock:
+        if current_cleanup is None:
+            return jsonify({"job": None})
+        return jsonify({"job": current_cleanup.to_dict()})
+
+
+@app.route("/api/storage/cleanup/cancel", methods=["POST"])
+def api_cleanup_cancel():
+    with cleanup_lock:
+        if current_cleanup and current_cleanup.status in ("pending", "running"):
+            current_cleanup.cancel()
+            return jsonify({"ok": True})
+    return jsonify({"error": "No running cleanup"}), 404
+
+
+@app.route("/api/archives")
+def api_archives():
+    return jsonify({"files": list_archives(ARCHIVE_DIR)})
+
+
+@app.route("/api/archives/<filename>")
+def api_archive_download(filename):
+    path = ARCHIVE_DIR / filename
+    if not path.exists() or not path.is_file():
+        return jsonify({"error": "Not found"}), 404
+    return send_file(path, as_attachment=True)
+
+
+@app.route("/api/archives/<filename>", methods=["DELETE"])
+def api_archive_delete(filename):
+    path = ARCHIVE_DIR / filename
+    if path.exists() and path.is_file() and path.suffix.lower() == ".zip":
         path.unlink()
     return jsonify({"ok": True})
 
@@ -401,6 +557,63 @@ input[type=checkbox] { width: auto; margin-right: 6px; }
   margin-top: 12px;
 }
 
+.storage-summary {
+  display: flex; gap: 14px; flex-wrap: wrap; padding: 12px;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; margin-bottom: 12px;
+}
+.storage-bar {
+  height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden;
+  border: 1px solid var(--border); margin-top: 8px;
+}
+.storage-bar-fill { height: 100%; background: var(--accent); transition: width .3s; }
+.storage-bar-fill.warn { background: var(--warn); }
+.storage-bar-fill.danger { background: var(--danger); }
+
+.month-list { display: flex; flex-direction: column; gap: 6px; }
+.month-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px; background: var(--bg); border-radius: 6px;
+  border: 1px solid var(--border); gap: 8px;
+}
+.month-row .month-name { font-weight: 600; font-size: .9rem; }
+.month-row .month-meta { font-size: .75rem; color: var(--muted); }
+
+.cleanup-form { margin-top: 12px; }
+.cleanup-form .row { margin-bottom: 8px; }
+.cleanup-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
+
+.preview-info {
+  padding: 10px; margin-top: 10px; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 6px;
+  font-size: .85rem; color: var(--muted);
+}
+.preview-info .val { color: var(--text); font-weight: 600; }
+
+.post-cleanup-card {
+  background: linear-gradient(135deg, rgba(10,132,255,.08), rgba(48,209,88,.08));
+  border: 1px solid var(--accent);
+}
+
+.compress-options {
+  margin-top: 10px; padding: 10px; background: var(--bg);
+  border-radius: 6px; border: 1px solid var(--border);
+}
+.compress-options-title {
+  font-size: .75rem; color: var(--muted); text-transform: uppercase;
+  letter-spacing: .5px; margin-bottom: 4px;
+}
+
+.tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+.tab {
+  padding: 8px 14px; cursor: pointer; font-size: .85rem;
+  color: var(--muted); border-bottom: 2px solid transparent;
+}
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
 .hidden { display: none !important; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -414,6 +627,15 @@ input[type=checkbox] { width: auto; margin-right: 6px; }
 <body>
 
 <h1><span class="icon">&#9201;</span> Timelapse Creator</h1>
+
+<!-- TABS -->
+<div class="tabs">
+  <div class="tab active" data-tab="generate" onclick="switchTab('generate')">Generuj</div>
+  <div class="tab" data-tab="storage" onclick="switchTab('storage')">Pamiec</div>
+</div>
+
+<!-- ============================ GENERATE TAB ============================ -->
+<div class="tab-content active" id="tab-generate">
 
 <!-- DATE RANGE SELECTION -->
 <div class="card">
@@ -510,6 +732,22 @@ input[type=checkbox] { width: auto; margin-right: 6px; }
   <video class="video-preview hidden" id="preview-video" controls></video>
 </div>
 
+<!-- POST-GENERATION CLEANUP -->
+<div class="card post-cleanup-card hidden" id="post-cleanup-card">
+  <div class="card-title">Optymalizacja pamieci</div>
+  <div style="font-size:.85rem; color:var(--muted); margin-bottom:10px;">
+    Timelapse gotowy. Mozesz teraz zwolnic miejsce na dysku posprzatajac
+    snapshoty z uzytego zakresu (<span id="post-cleanup-range" class="val" style="color:var(--text)"></span>).
+  </div>
+  <div class="preview-info" id="post-cleanup-info">Ladowanie...</div>
+  <div class="cleanup-actions">
+    <button class="btn btn-sm btn-ghost" onclick="postCleanup('archive')">Archiwizuj (ZIP)</button>
+    <button class="btn btn-sm btn-ghost" onclick="postCleanup('compress')">Skompresuj</button>
+    <button class="btn btn-sm btn-danger" onclick="postCleanup('delete')">Usun</button>
+    <button class="btn btn-sm btn-ghost" onclick="hide('post-cleanup-card')">Pomin</button>
+  </div>
+</div>
+
 <!-- OUTPUT LIST -->
 <div class="card" id="outputs-card">
   <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">
@@ -521,11 +759,136 @@ input[type=checkbox] { width: auto; margin-right: 6px; }
   </ul>
 </div>
 
+</div><!-- /tab-generate -->
+
+<!-- ============================ STORAGE TAB ============================ -->
+<div class="tab-content" id="tab-storage">
+
+<div class="card">
+  <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">
+    Wykorzystanie dysku
+    <button class="btn btn-sm btn-ghost" onclick="loadStorage()">Odswiez</button>
+  </div>
+  <div class="storage-summary" id="storage-summary">
+    <div class="empty" style="width:100%">Ladowanie...</div>
+  </div>
+  <div class="month-list" id="month-list"></div>
+</div>
+
+<div class="card">
+  <div class="card-title">Sprzatanie zakresu</div>
+  <div style="font-size:.8rem; color:var(--muted); margin-bottom:10px;">
+    Wybierz zakres dat i godzin, a nastepnie akcje. Mozesz tez kliknac
+    miesiac w liscie powyzej zeby wypelnic ten zakres.
+  </div>
+  <div class="cleanup-form">
+    <div class="row">
+      <div>
+        <label>Od</label>
+        <input type="date" id="cleanup-from">
+      </div>
+      <div>
+        <label>Do</label>
+        <input type="date" id="cleanup-to">
+      </div>
+      <div>
+        <label>Godz. od</label>
+        <input type="number" id="cleanup-hour-from" value="0" min="0" max="23">
+      </div>
+      <div>
+        <label>Godz. do</label>
+        <input type="number" id="cleanup-hour-to" value="24" min="1" max="24">
+      </div>
+    </div>
+    <div style="display:flex; gap:8px; margin-top:10px;">
+      <button class="btn btn-sm btn-ghost" onclick="loadCleanupPreview()">Sprawdz zakres</button>
+    </div>
+    <div class="preview-info hidden" id="cleanup-preview"></div>
+
+    <div class="compress-options" id="compress-options">
+      <div class="compress-options-title">Opcje kompresji (uzywane tylko dla "Skompresuj")</div>
+      <div class="row">
+        <div>
+          <label>Jakosc JPG (1-100, niska = mniejszy plik)</label>
+          <input type="number" id="compress-quality" value="70" min="10" max="100">
+        </div>
+        <div>
+          <label>Maks. szerokosc px (0 = bez zmiany)</label>
+          <input type="number" id="compress-maxwidth" value="0" min="0" max="4096">
+        </div>
+      </div>
+    </div>
+
+    <div class="cleanup-actions">
+      <button class="btn btn-ghost" onclick="setCleanupAction('archive')">Archiwizuj (ZIP)</button>
+      <button class="btn btn-ghost" onclick="setCleanupAction('compress')">Skompresuj</button>
+      <button class="btn btn-danger" onclick="setCleanupAction('delete')">Usun</button>
+    </div>
+  </div>
+</div>
+
+<!-- CLEANUP PROGRESS -->
+<div class="card hidden" id="cleanup-progress-card">
+  <div class="card-title" style="display:flex;align-items:center;gap:8px;">
+    <span class="spinner" id="cleanup-spinner"></span>
+    <span id="cleanup-status-text">Przetwarzanie...</span>
+  </div>
+  <div class="progress-section">
+    <div class="progress-wrap"><div class="progress-bar" id="cleanup-progress-bar"></div></div>
+    <div class="progress-text" id="cleanup-progress-text"></div>
+    <div class="progress-stats" id="cleanup-progress-stats"></div>
+  </div>
+  <div style="margin-top:10px">
+    <button class="btn btn-sm btn-danger" id="btn-cleanup-cancel" onclick="cancelCleanup()">Anuluj</button>
+  </div>
+</div>
+
+<!-- ARCHIVES LIST -->
+<div class="card" id="archives-card">
+  <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">
+    Archiwa
+    <button class="btn btn-sm btn-ghost" onclick="loadArchives()">Odswiez</button>
+  </div>
+  <ul class="output-list" id="archive-list">
+    <li class="empty">Ladowanie...</li>
+  </ul>
+</div>
+
+</div><!-- /tab-storage -->
+
 <script>
 const BASE = window.location.pathname.replace(/\/+$/, '');
 let scanTotal = 0;
 let pollTimer = null;
+let cleanupPollTimer = null;
 let activePreset = null;
+let lastJobRange = null;
+
+function fmtBytes(bytes) {
+  if (!bytes || bytes < 1024) return (bytes || 0) + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+  return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+// --- Tabs ---
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + name));
+  if (name === 'storage') {
+    loadStorage();
+    loadArchives();
+    checkActiveCleanup();
+  }
+}
+
+async function checkActiveCleanup() {
+  const res = await api('/api/storage/cleanup/status');
+  if (res.job && (res.job.status === 'pending' || res.job.status === 'running')) {
+    show('cleanup-progress-card');
+    if (!cleanupPollTimer) startCleanupPolling();
+  }
+}
 
 // --- Presets ---
 function setPreset(key) {
@@ -627,6 +990,7 @@ async function doGenerate(preview) {
   const res = await api('/api/generate', 'POST', body);
   if (res.error) { alert(res.error); return; }
 
+  hide('post-cleanup-card');
   show('progress-card');
   document.getElementById('preview-video').classList.add('hidden');
   document.getElementById('btn-cancel').classList.remove('hidden');
@@ -678,11 +1042,234 @@ async function pollJob() {
       video.src = BASE + '/api/outputs/' + encodeURIComponent(j.output_file) + '/stream';
       video.classList.remove('hidden');
       loadOutputs();
+
+      lastJobRange = j.source_range || null;
+      if (lastJobRange && !lastJobRange.preview) {
+        showPostCleanupCard();
+      }
     }
     if (j.status === 'error') {
       document.getElementById('progress-text').textContent = 'Blad: ' + (j.error || 'Unknown');
     }
   }
+}
+
+// --- Post-generation cleanup ---
+async function showPostCleanupCard() {
+  if (!lastJobRange) return;
+  const r = lastJobRange;
+  document.getElementById('post-cleanup-range').textContent =
+    `${r.from} - ${r.to}, godz. ${r.hour_from}:00-${r.hour_to}:00`;
+  show('post-cleanup-card');
+
+  const info = document.getElementById('post-cleanup-info');
+  info.textContent = 'Liczenie...';
+  const q = `from=${r.from}&to=${r.to}&hour_from=${r.hour_from}&hour_to=${r.hour_to}`;
+  const res = await api('/api/storage/preview?' + q);
+  if (res.error) {
+    info.textContent = 'Blad: ' + res.error;
+    return;
+  }
+  info.innerHTML = `Snapshotow: <span class="val">${res.count.toLocaleString()}</span> &middot;
+                    Rozmiar: <span class="val">${fmtBytes(res.size_bytes)}</span>`;
+}
+
+async function postCleanup(action) {
+  if (!lastJobRange) return;
+  const r = lastJobRange;
+  await runCleanup(action, r.from, r.to, r.hour_from, r.hour_to);
+  hide('post-cleanup-card');
+}
+
+// --- Storage tab ---
+async function loadStorage() {
+  const res = await api('/api/storage');
+  const summary = document.getElementById('storage-summary');
+  const list = document.getElementById('month-list');
+
+  if (!res.exists) {
+    summary.innerHTML = '<div class="empty" style="width:100%">Folder snapshotow nie istnieje</div>';
+    list.innerHTML = '';
+    return;
+  }
+
+  const usedPct = res.total_disk_bytes
+    ? ((res.total_disk_bytes - res.free_bytes) / res.total_disk_bytes * 100)
+    : 0;
+  let barClass = '';
+  if (usedPct > 90) barClass = 'danger';
+  else if (usedPct > 75) barClass = 'warn';
+
+  summary.innerHTML = `
+    <div class="stat"><div class="stat-val stat-accent">${res.total_files.toLocaleString()}</div><div class="stat-lbl">Snapshotow</div></div>
+    <div class="stat"><div class="stat-val">${fmtBytes(res.total_bytes)}</div><div class="stat-lbl">Zajmuja</div></div>
+    <div class="stat"><div class="stat-val">${fmtBytes(res.free_bytes)}</div><div class="stat-lbl">Wolne na dysku</div></div>
+    <div style="flex:1; min-width:200px;">
+      <div style="font-size:.75rem; color:var(--muted)">Wykorzystanie dysku: ${usedPct.toFixed(0)}%</div>
+      <div class="storage-bar"><div class="storage-bar-fill ${barClass}" style="width:${usedPct}%"></div></div>
+    </div>
+  `;
+
+  if (!res.months.length) {
+    list.innerHTML = '<div class="empty">Brak danych</div>';
+    return;
+  }
+
+  list.innerHTML = res.months.map(m => {
+    const [y, mo] = m.month.split('-');
+    return `<div class="month-row" onclick="selectMonth('${m.month}')">
+      <div>
+        <div class="month-name">${m.month}</div>
+        <div class="month-meta">${m.count.toLocaleString()} plikow &middot; ${fmtBytes(m.size_bytes)}</div>
+      </div>
+      <button class="btn btn-sm btn-ghost" onclick="event.stopPropagation(); selectMonth('${m.month}')">Wybierz</button>
+    </div>`;
+  }).join('');
+}
+
+function selectMonth(month) {
+  const [y, mo] = month.split('-');
+  const first = `${y}-${mo}-01`;
+  const lastDay = new Date(parseInt(y), parseInt(mo), 0).getDate();
+  const last = `${y}-${mo}-${String(lastDay).padStart(2, '0')}`;
+  document.getElementById('cleanup-from').value = first;
+  document.getElementById('cleanup-to').value = last;
+  document.getElementById('cleanup-hour-from').value = 0;
+  document.getElementById('cleanup-hour-to').value = 24;
+  loadCleanupPreview();
+}
+
+function getCleanupRange() {
+  return {
+    from: document.getElementById('cleanup-from').value,
+    to: document.getElementById('cleanup-to').value,
+    hour_from: parseInt(document.getElementById('cleanup-hour-from').value) || 0,
+    hour_to: parseInt(document.getElementById('cleanup-hour-to').value) || 24,
+  };
+}
+
+async function loadCleanupPreview() {
+  const r = getCleanupRange();
+  if (!r.from || !r.to) {
+    alert('Wybierz zakres dat');
+    return;
+  }
+  const el = document.getElementById('cleanup-preview');
+  el.classList.remove('hidden');
+  el.textContent = 'Liczenie...';
+
+  const q = `from=${r.from}&to=${r.to}&hour_from=${r.hour_from}&hour_to=${r.hour_to}`;
+  const res = await api('/api/storage/preview?' + q);
+  if (res.error) { el.textContent = 'Blad: ' + res.error; return; }
+
+  el.innerHTML = `Snapshotow do przetworzenia: <span class="val">${res.count.toLocaleString()}</span> &middot;
+                  Rozmiar: <span class="val">${fmtBytes(res.size_bytes)}</span>`;
+}
+
+function setCleanupAction(action) {
+  const r = getCleanupRange();
+  if (!r.from || !r.to) { alert('Wybierz zakres dat'); return; }
+  runCleanup(action, r.from, r.to, r.hour_from, r.hour_to);
+}
+
+async function runCleanup(action, from, to, hour_from, hour_to) {
+  const labels = {
+    delete: 'Na pewno PERMANENTNIE usunac wybrane snapshoty?',
+    archive: 'Spakowac wybrane snapshoty do ZIP i usunac oryginaly?',
+    compress: 'Skompresowac wybrane snapshoty (re-encode JPG)?',
+  };
+  if (!confirm(labels[action] || 'Kontynuowac?')) return;
+
+  const body = { action, from, to, hour_from, hour_to };
+  if (action === 'compress') {
+    body.quality = parseInt(document.getElementById('compress-quality').value) || 70;
+    body.max_width = parseInt(document.getElementById('compress-maxwidth').value) || 0;
+  }
+
+  const res = await api('/api/storage/cleanup', 'POST', body);
+  if (res.error) { alert(res.error); return; }
+
+  switchTab('storage');
+  show('cleanup-progress-card');
+  document.getElementById('cleanup-spinner').classList.remove('hidden');
+  document.getElementById('btn-cleanup-cancel').classList.remove('hidden');
+  document.getElementById('cleanup-progress-bar').style.width = '0%';
+  startCleanupPolling();
+}
+
+function startCleanupPolling() {
+  if (cleanupPollTimer) clearInterval(cleanupPollTimer);
+  cleanupPollTimer = setInterval(pollCleanup, 1500);
+  pollCleanup();
+}
+
+async function pollCleanup() {
+  const res = await api('/api/storage/cleanup/status');
+  if (!res.job) return;
+  const j = res.job;
+
+  document.getElementById('cleanup-progress-bar').style.width = j.progress + '%';
+  document.getElementById('cleanup-progress-text').textContent = j.message;
+  document.getElementById('cleanup-status-text').textContent =
+    j.status === 'pending' ? 'Przygotowanie...' :
+    j.status === 'running' ?
+      (j.action === 'delete' ? 'Usuwanie plikow...' :
+       j.action === 'archive' ? 'Archiwizacja...' :
+       j.action === 'compress' ? 'Kompresja...' : 'Przetwarzanie...') :
+    j.status === 'done' ? 'Gotowe!' :
+    j.status === 'error' ? 'Blad' :
+    j.status === 'cancelled' ? 'Anulowane' : 'Przetwarzanie...';
+
+  document.getElementById('cleanup-progress-stats').innerHTML = `
+    <span>Plikow: <span class="val">${j.processed_files}/${j.total_files}</span></span>
+    ${j.failed_files > 0 ? `<span>Bledne: <span class="val">${j.failed_files}</span></span>` : ''}
+    <span>Zwolnione: <span class="val">${fmtBytes(j.bytes_freed)}</span></span>
+  `;
+
+  if (j.status === 'done' || j.status === 'error' || j.status === 'cancelled') {
+    clearInterval(cleanupPollTimer);
+    cleanupPollTimer = null;
+    document.getElementById('cleanup-spinner').classList.add('hidden');
+    document.getElementById('btn-cleanup-cancel').classList.add('hidden');
+    if (j.status === 'error') {
+      document.getElementById('cleanup-progress-text').textContent = 'Blad: ' + (j.error || 'Unknown');
+    }
+    loadStorage();
+    loadArchives();
+  }
+}
+
+async function cancelCleanup() {
+  await api('/api/storage/cleanup/cancel', 'POST');
+}
+
+// --- Archives ---
+async function loadArchives() {
+  const res = await api('/api/archives');
+  const ul = document.getElementById('archive-list');
+  if (!res.files || !res.files.length) {
+    ul.innerHTML = '<li class="empty">Brak archiwow</li>';
+    return;
+  }
+  ul.innerHTML = res.files.map(f => `
+    <li class="output-item">
+      <div>
+        <div class="output-name">${f.name}</div>
+        <div class="output-meta">${f.size_mb} MB &middot; ${f.created}</div>
+      </div>
+      <div class="output-actions">
+        <a class="btn btn-sm btn-primary" href="${BASE}/api/archives/${encodeURIComponent(f.name)}" download>Pobierz</a>
+        <button class="btn btn-sm btn-danger" onclick="deleteArchive('${f.name}')">Usun</button>
+      </div>
+    </li>
+  `).join('');
+}
+
+async function deleteArchive(name) {
+  if (!confirm('Usunac archiwum ' + name + '?')) return;
+  await api('/api/archives/' + encodeURIComponent(name), 'DELETE');
+  loadArchives();
+  loadStorage();
 }
 
 // --- Outputs ---

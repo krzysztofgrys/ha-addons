@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir flask
 COPY run.sh /
 COPY app.py /
 COPY timelapse.py /
+COPY storage.py /
 
 RUN chmod +x /run.sh
 
